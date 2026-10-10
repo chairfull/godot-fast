@@ -106,7 +106,7 @@ index c9996e8..a74509a 100644
 +
 +	WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(
 +			this, &EditorFileSystem::_script_doc_thread,
-+			thread_data.ptr(), thread_data.size(), -1, false,
++			thread_data.ptrw(), thread_data.size(), -1, false,
 +			vformat(TTR("Updating scripts documentation (%d files)"), thread_data.size()));
 +
 +	// Poll progress on the calling thread while the workers compile scripts.
