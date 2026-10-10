@@ -1,0 +1,51 @@
+From e4d0a676ea7735b93e63c89ce0a89a460d9b13b6 Mon Sep 17 00:00:00 2001
+From: Michael Knopke <knopkem@gmail.com>
+Date: Mon, 27 Jul 2026 15:24:48 +0200
+Subject: [PATCH 5/9] RenderingServer: Make the redraw change counter atomic
+
+redraw_request() increments a plain static int on every write action.
+With resources being created and modified from worker threads (e.g.
+threaded imports), this raced. Found with ThreadSanitizer.
+---
+ servers/rendering/rendering_server_default.cpp | 2 +-
+ servers/rendering/rendering_server_default.h   | 4 +++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/servers/rendering/rendering_server_default.cpp b/servers/rendering/rendering_server_default.cpp
+index 82eebf5e..d2e3ae50 100644
+--- a/servers/rendering/rendering_server_default.cpp
++++ b/servers/rendering/rendering_server_default.cpp
+@@ -45,7 +45,7 @@
+ 
+ // careful, these may run in different threads than the rendering server
+ 
+-int RenderingServerDefault::changes = 0;
++std::atomic<int> RenderingServerDefault::changes = 0;
+ 
+ /* FREE */
+ 
+diff --git a/servers/rendering/rendering_server_default.h b/servers/rendering/rendering_server_default.h
+index 811858e4..aa6300d0 100644
+--- a/servers/rendering/rendering_server_default.h
++++ b/servers/rendering/rendering_server_default.h
+@@ -38,6 +38,8 @@
+ #include "servers/rendering/renderer_compositor.h"
+ #include "servers/rendering/renderer_viewport.h"
+ #include "servers/rendering/rendering_method.h"
++
++#include <atomic>
+ #include "servers/rendering/rendering_server.h"
+ #include "servers/rendering/rendering_server_enums.h"
+ #include "servers/rendering/rendering_server_globals.h"
+@@ -59,7 +61,7 @@ class RenderingServerDefault : public RenderingServer {
+ 
+ 	};
+ 
+-	static int changes;
++	static std::atomic<int> changes;
+ 	RID test_cube;
+ 
+ 	List<Callable> frame_drawn_callbacks;
+-- 
+2.43.0
+

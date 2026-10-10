@@ -1,0 +1,550 @@
+From 5e27837aab0690d6ec5c225ac712d1526ebc43bf Mon Sep 17 00:00:00 2001
+From: Stuart Carnie <stuart.carnie@gmail.com>
+Date: Sat, 3 Oct 2026 09:06:37 +1000
+Subject: [PATCH 9/9] editor: Improve filesystem dock and import performance
+
+---
+ core/string/ustring.cpp                   |   2 +-
+ core/string/ustring.h                     |   8 +-
+ drivers/unix/dir_access_unix.cpp          |   2 -
+ drivers/unix/dir_access_unix.h            |   2 +-
+ drivers/unix/file_access_unix.cpp         |  44 +++++---
+ editor/docks/filesystem_dock.cpp          |  74 ++++++++++++--
+ editor/docks/filesystem_dock.h            |  15 +++
+ editor/file_system/editor_file_system.cpp | 119 ++++++++++++++--------
+ platform/macos/dir_access_macos.mm        |  27 ++++-
+ 9 files changed, 218 insertions(+), 75 deletions(-)
+
+diff --git a/core/string/ustring.cpp b/core/string/ustring.cpp
+index 94d9a06b..b3d6cf10 100644
+--- a/core/string/ustring.cpp
++++ b/core/string/ustring.cpp
+@@ -1365,7 +1365,7 @@ char32_t String::char_uppercase(char32_t p_char) {
+ 	return _find_upper(p_char);
+ }
+ 
+-char32_t String::char_lowercase(char32_t p_char) {
++char32_t String::_char_lowercase_table(char32_t p_char) {
+ 	return _find_lower(p_char);
+ }
+ 
+diff --git a/core/string/ustring.h b/core/string/ustring.h
+index 552b648e..69b848ed 100644
+--- a/core/string/ustring.h
++++ b/core/string/ustring.h
+@@ -302,6 +302,7 @@ class [[nodiscard]] _WARN_UNUSED_ String {
+ 	bool _base_is_subsequence_of(const String &p_string, bool p_case_insensitive) const;
+ 	int _count(const String &p_string, int p_from, int p_to, bool p_case_insensitive) const;
+ 	int _count(const char *p_string, int p_from, int p_to, bool p_case_insensitive) const;
++	static char32_t _char_lowercase_table(char32_t p_char);
+ 	String _separate_compound_words() const;
+ 
+ public:
+@@ -507,7 +508,12 @@ public:
+ 	String join(const Vector<String> &p_parts) const;
+ 
+ 	static char32_t char_uppercase(char32_t p_char);
+-	static char32_t char_lowercase(char32_t p_char);
++	static _FORCE_INLINE_ char32_t char_lowercase(char32_t p_char) {
++		if (p_char < 128) {
++			return is_ascii_upper_case(p_char) ? p_char + ('a' - 'A') : p_char;
++		}
++		return _char_lowercase_table(p_char);
++	}
+ 	String to_upper() const;
+ 	String to_lower() const;
+ 
+diff --git a/drivers/unix/dir_access_unix.cpp b/drivers/unix/dir_access_unix.cpp
+index f1ee07ce..5ae79973 100644
+--- a/drivers/unix/dir_access_unix.cpp
++++ b/drivers/unix/dir_access_unix.cpp
+@@ -741,8 +741,6 @@ DirAccessUnix::DirAccessUnix() {
+ 	if (current_dir.append_utf8(real_current_dir_name) != OK) {
+ 		current_dir = real_current_dir_name;
+ 	}
+-
+-	change_dir(current_dir);
+ }
+ 
+ DirAccessUnix::RemoveNotificationFunc DirAccessUnix::remove_notification_func = nullptr;
+diff --git a/drivers/unix/dir_access_unix.h b/drivers/unix/dir_access_unix.h
+index a59b49fd..71c72a20 100644
+--- a/drivers/unix/dir_access_unix.h
++++ b/drivers/unix/dir_access_unix.h
+@@ -41,12 +41,12 @@
+ 
+ class DirAccessUnix : public DirAccess {
+ 	GDSOFTCLASS(DirAccessUnix, DirAccess);
+-	DIR *dir_stream = nullptr;
+ 
+ 	bool _cisdir = false;
+ 	bool _cishidden = false;
+ 
+ protected:
++	DIR *dir_stream = nullptr;
+ 	String current_dir;
+ 	virtual String fix_unicode_name(const char *p_name) const { return String::utf8(p_name); }
+ 	virtual bool is_hidden(const String &p_name);
+diff --git a/drivers/unix/file_access_unix.cpp b/drivers/unix/file_access_unix.cpp
+index 58cbd2fd..eb70bb1a 100644
+--- a/drivers/unix/file_access_unix.cpp
++++ b/drivers/unix/file_access_unix.cpp
+@@ -35,6 +35,9 @@
+ #include "core/string/ustring.h"
+ 
+ #include <fcntl.h>
++#if defined(__APPLE__)
++#include <sys/param.h>
++#endif
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #if !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__) && !defined(WEB_ENABLED)
+@@ -99,22 +102,6 @@ Error FileAccessUnix::open_internal(const String &p_path, int p_mode_flags) {
+ 		}
+ 	}
+ 
+-#if defined(TOOLS_ENABLED)
+-	if (p_mode_flags & READ) {
+-		String real_path = get_real_path();
+-		if (real_path != path) {
+-			// Don't warn on symlinks, since they can be used to simply share addons on multiple projects.
+-			if (real_path.to_lower() == path.to_lower()) {
+-				// The File system is case insensitive, but other platforms can be sensitive to it
+-				// To ease cross-platform development, we issue a warning if users try to access
+-				// a file using the wrong case (which *works* on Windows and macOS, but won't on other
+-				// platforms).
+-				WARN_PRINT(vformat("Case mismatch opening requested file '%s', stored as '%s' in the filesystem. This file will not open when exported to other case-sensitive platforms.", path, real_path));
+-			}
+-		}
+-	}
+-#endif
+-
+ 	if (is_backup_save_enabled() && (p_mode_flags == WRITE)) {
+ 		// Set save path to the symlink target, not the link itself.
+ 		String link;
+@@ -182,6 +169,22 @@ Error FileAccessUnix::open_internal(const String &p_path, int p_mode_flags) {
+ 		return last_error;
+ 	}
+ 
++#if defined(TOOLS_ENABLED)
++	if (p_mode_flags & READ) {
++		String real_path = get_real_path();
++		if (real_path != path) {
++			// Don't warn on symlinks, since they can be used to simply share addons on multiple projects.
++			if (real_path.to_lower() == path.to_lower()) {
++				// The File system is case insensitive, but other platforms can be sensitive to it
++				// To ease cross-platform development, we issue a warning if users try to access
++				// a file using the wrong case (which *works* on Windows and macOS, but won't on other
++				// platforms).
++				WARN_PRINT(vformat("Case mismatch opening requested file '%s', stored as '%s' in the filesystem. This file will not open when exported to other case-sensitive platforms.", path, real_path));
++			}
++		}
++	}
++#endif
++
+ 	// Set close on exec to avoid leaking it to subprocesses.
+ 	int fd = fileno(f);
+ 
+@@ -233,6 +236,14 @@ String FileAccessUnix::get_path_absolute() const {
+ 
+ #if defined(TOOLS_ENABLED)
+ String FileAccessUnix::get_real_path() const {
++#if defined(__APPLE__)
++	char buf[MAXPATHLEN];
++	if (fcntl(fileno(f), F_GETPATH, buf) == -1) {
++		return path;
++	}
++	String result;
++	return result.append_utf8(buf) == OK ? result : path;
++#else
+ 	char *resolved_path = ::realpath(path.utf8().get_data(), nullptr);
+ 
+ 	if (!resolved_path) {
+@@ -248,6 +259,7 @@ String FileAccessUnix::get_real_path() const {
+ 	}
+ 
+ 	return result.simplify_path();
++#endif
+ }
+ #endif
+ 
+diff --git a/editor/docks/filesystem_dock.cpp b/editor/docks/filesystem_dock.cpp
+index 4ec33b51..6c96a28d 100644
+--- a/editor/docks/filesystem_dock.cpp
++++ b/editor/docks/filesystem_dock.cpp
+@@ -322,6 +322,8 @@ void FileSystemDock::_create_tree(TreeItem *p_parent, EditorFileSystemDirectory
+ 
+ 		// Build the tree.
+ 		const int icon_size = get_theme_constant(SNAME("class_icon_size"), EditorStringName(Editor));
++		// Previews for files in collapsed folders are requested when the folder is expanded.
++		const bool files_shown = _is_tree_item_expanded(subdirectory_item);
+ 
+ 		for (const FileInfo &file_info : file_list) {
+ 			TreeItem *file_item = tree->create_item(subdirectory_item);
+@@ -349,7 +351,9 @@ void FileSystemDock::_create_tree(TreeItem *p_parent, EditorFileSystemDirectory
+ 			if (main_scene_path == file_metadata) {
+ 				file_item->set_custom_color(0, get_theme_color(SNAME("accent_color"), EditorStringName(Editor)));
+ 			}
+-			EditorResourcePreview::get_singleton()->queue_resource_preview(file_metadata, callable_mp(this, &FileSystemDock::_tree_thumbnail_done).bind(tree_update_id, file_item->get_instance_id()));
++			if (files_shown) {
++				_queue_tree_item_preview(file_item, file_metadata);
++			}
+ 		}
+ 	} else if (lpath.get_base_dir() == current_path.get_base_dir()) {
+ 		subdirectory_item->select(0);
+@@ -394,6 +398,8 @@ void FileSystemDock::_update_tree(const Vector<String> &p_uncollapsed_paths, boo
+ 	// Recreate the tree.
+ 	tree->clear();
+ 	tree_update_id++;
++	tree_preview_requested.clear();
++	pending_tree_thumbnails.clear();
+ 	updating_tree = true;
+ 	TreeItem *root = tree->create_item();
+ 	root->set_accept_children(false);
+@@ -470,8 +476,8 @@ void FileSystemDock::_update_tree(const Vector<String> &p_uncollapsed_paths, boo
+ 			ti->set_custom_color(0, get_theme_color(SNAME("accent_color"), EditorStringName(Editor)));
+ 		}
+ 
+-		if (!favorite.ends_with("/")) {
+-			EditorResourcePreview::get_singleton()->queue_resource_preview(favorite, callable_mp(this, &FileSystemDock::_tree_thumbnail_done).bind(tree_update_id, ti->get_instance_id()));
++		if (!favorite.ends_with("/") && !favorites_item->is_collapsed()) {
++			_queue_tree_item_preview(ti, favorite);
+ 		}
+ 	}
+ 
+@@ -612,6 +618,10 @@ void FileSystemDock::_notification(int p_what) {
+ 			}
+ 		} break;
+ 
++		case NOTIFICATION_INTERNAL_PROCESS: {
++			_apply_pending_tree_thumbnails();
++		} break;
++
+ 		case NOTIFICATION_PROCESS: {
+ 			if (EditorFileSystem::get_singleton()->is_scanning()) {
+ 				scanning_progress->set_value(EditorFileSystem::get_singleton()->get_scanning_progress() * 100.0f);
+@@ -921,10 +931,61 @@ void FileSystemDock::_file_list_thumbnail_done(const String &p_path, const Ref<T
+ }
+ 
+ void FileSystemDock::_tree_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_update_id, ObjectID p_item) {
+-	TreeItem *item = ObjectDB::get_instance<TreeItem>(p_item);
+-	if (item && tree_update_id == p_update_id && p_small_preview.is_valid()) {
+-		item->set_icon(0, _apply_thumbnail_filter(p_small_preview, p_path));
++	if (tree_update_id != p_update_id || p_small_preview.is_null()) {
++		return;
++	}
++	pending_tree_thumbnails.push_back({ p_item, p_path, p_small_preview });
++	set_process_internal(true);
++}
++
++void FileSystemDock::_apply_pending_tree_thumbnails() {
++	for (const PendingTreeThumbnail &pending : pending_tree_thumbnails) {
++		TreeItem *item = ObjectDB::get_instance<TreeItem>(pending.item);
++		if (item) {
++			item->set_icon(0, _apply_thumbnail_filter(pending.preview, pending.path));
++		}
++	}
++	pending_tree_thumbnails.clear();
++	set_process_internal(false);
++}
++
++bool FileSystemDock::_is_tree_item_expanded(TreeItem *p_item) {
++	for (TreeItem *item = p_item; item; item = item->get_parent()) {
++		if (item->is_collapsed()) {
++			return false;
++		}
++	}
++	return true;
++}
++
++void FileSystemDock::_queue_tree_item_preview(TreeItem *p_item, const String &p_path) {
++	const ObjectID id = p_item->get_instance_id();
++	if (tree_preview_requested.has(id)) {
++		return;
++	}
++	tree_preview_requested.insert(id);
++	EditorResourcePreview::get_singleton()->queue_resource_preview(p_path, callable_mp(this, &FileSystemDock::_tree_thumbnail_done).bind(tree_update_id, id));
++}
++
++void FileSystemDock::_queue_tree_children_previews(TreeItem *p_item) {
++	for (TreeItem *child = p_item->get_first_child(); child; child = child->get_next()) {
++		const String path = child->get_metadata(0);
++		if (!path.begins_with("res://")) {
++			continue;
++		}
++		if (!path.ends_with("/")) {
++			_queue_tree_item_preview(child, path);
++		} else if (!child->is_collapsed()) {
++			_queue_tree_children_previews(child);
++		}
++	}
++}
++
++void FileSystemDock::_tree_item_collapsed(TreeItem *p_item) {
++	if (!_is_tree_item_expanded(p_item)) {
++		return;
+ 	}
++	_queue_tree_children_previews(p_item);
+ }
+ 
+ Ref<Texture2D> FileSystemDock::_apply_thumbnail_filter(const Ref<Texture2D> &p_thumbnail, const String &p_file_path) const {
+@@ -4672,6 +4733,7 @@ FileSystemDock::FileSystemDock() {
+ 	tree_mc->add_child(tree);
+ 
+ 	tree->connect("item_activated", callable_mp(this, &FileSystemDock::_tree_activate_file));
++	tree->connect("item_collapsed", callable_mp(this, &FileSystemDock::_tree_item_collapsed));
+ 	tree->connect("multi_selected", callable_mp(this, &FileSystemDock::_tree_multi_selected));
+ 	tree->connect("item_mouse_selected", callable_mp(this, &FileSystemDock::_tree_rmb_select));
+ 	tree->connect("empty_clicked", callable_mp(this, &FileSystemDock::_tree_empty_click));
+diff --git a/editor/docks/filesystem_dock.h b/editor/docks/filesystem_dock.h
+index 2f84d2be..12e55850 100644
+--- a/editor/docks/filesystem_dock.h
++++ b/editor/docks/filesystem_dock.h
+@@ -261,6 +261,16 @@ private:
+ 
+ 	bool updating_tree = false;
+ 	int tree_update_id;
++
++	struct PendingTreeThumbnail {
++		ObjectID item;
++		String path;
++		Ref<Texture2D> preview;
++	};
++	HashSet<ObjectID> tree_preview_requested;
++	// Applied once per frame to limit tree redraws.
++	LocalVector<PendingTreeThumbnail> pending_tree_thumbnails;
++
+ 	FileSystemTree *tree = nullptr;
+ 	FileSystemList *files = nullptr;
+ 	bool import_dock_needs_update = false;
+@@ -384,6 +394,11 @@ private:
+ 	void _preview_invalidated(const String &p_path);
+ 	void _file_list_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_index, const String &p_filename);
+ 	void _tree_thumbnail_done(const String &p_path, const Ref<Texture2D> &p_preview, const Ref<Texture2D> &p_small_preview, int p_update_id, ObjectID p_item);
++	void _apply_pending_tree_thumbnails();
++	static bool _is_tree_item_expanded(TreeItem *p_item);
++	void _queue_tree_item_preview(TreeItem *p_item, const String &p_path);
++	void _queue_tree_children_previews(TreeItem *p_item);
++	void _tree_item_collapsed(TreeItem *p_item);
+ 	Ref<Texture2D> _apply_thumbnail_filter(const Ref<Texture2D> &p_thumbnail, const String &p_file_path) const;
+ 
+ 	void _update_display_mode(bool p_force = false);
+diff --git a/editor/file_system/editor_file_system.cpp b/editor/file_system/editor_file_system.cpp
+index 9b42e4d3..356bad5d 100644
+--- a/editor/file_system/editor_file_system.cpp
++++ b/editor/file_system/editor_file_system.cpp
+@@ -1900,57 +1900,92 @@ void EditorFileSystem::_save_filesystem_cache(EditorFileSystemDirectory *p_dir,
+ 	}
+ }
+ 
+-bool EditorFileSystem::_find_file(const String &p_file, EditorFileSystemDirectory **r_d, int &r_file_pos) const {
+-	//todo make faster
+-
+-	if (!filesystem || scanning) {
+-		return false;
++static bool _span_equals(const Span<char32_t> &p_a, const Span<char32_t> &p_b, bool p_case_sensitive) {
++	if (p_case_sensitive) {
++		return p_a == p_b;
+ 	}
+-
+-	String f = ProjectSettings::get_singleton()->localize_path(p_file);
+-	if (!f.begins_with("res://")) {
++	if (p_a.size() != p_b.size()) {
+ 		return false;
+ 	}
+-	f = f.substr(6);
+-	f = f.replace_char('\\', '/');
++	const char32_t *a = p_a.ptr();
++	const char32_t *b = p_b.ptr();
++	for (uint64_t i = 0; i < p_a.size(); i++) {
++		if (a[i] != b[i] && String::char_lowercase(a[i]) != String::char_lowercase(b[i])) {
++			return false;
++		}
++	}
++	return true;
++}
+ 
+-	Vector<String> path = f.split("/");
++// Returns true when `simplify_path()` would return `p_path` unchanged:
++// no backslashes, no empty, "." or ".." segments, and no trailing slash.
++static bool _is_simple_res_path(const String &p_path) {
++	const char32_t *str = p_path.ptr();
++	const int len = p_path.length();
++	int seg_start = 6; // After "res://".
++	for (int i = seg_start; i <= len; i++) {
++		const char32_t c = i < len ? str[i] : '/';
++		if (c == '\\') {
++			return false;
++		}
++		if (c != '/') {
++			continue;
++		}
++		const int seg_len = i - seg_start;
++		if (seg_len == 0 && i < len) {
++			return false;
++		}
++		if (str[seg_start] == '.' && (seg_len == 1 || (seg_len == 2 && str[seg_start + 1] == '.'))) {
++			return false;
++		}
++		seg_start = i + 1;
++	}
++	return len == 6 || str[len - 1] != '/';
++}
+ 
+-	if (path.is_empty()) {
++bool EditorFileSystem::_find_file(const String &p_file, EditorFileSystemDirectory **r_d, int &r_file_pos) const {
++	if (!filesystem || scanning) {
+ 		return false;
+ 	}
+-	const String file = path[path.size() - 1];
+-	const String file_lower = file.to_lower();
+-	path.resize(path.size() - 1);
+ 
+-	Ref<DirAccess> dir = DirAccess::create(DirAccess::ACCESS_FILESYSTEM);
++	// Skip `localize_path()` when it would return the path unchanged, as it always allocates.
++	String f = p_file;
++	if (!f.begins_with("res://") || !_is_simple_res_path(f)) {
++		f = ProjectSettings::get_singleton()->localize_path(p_file);
++		if (!f.begins_with("res://")) {
++			return false;
++		}
++	}
++
++	const Span<char32_t> str = f.span();
++	uint64_t seg_start = 6; // After "res://".
++
+ 	EditorFileSystemDirectory *fs = filesystem;
+ 
+-	for (const String &path_bit : path) {
+-		if (path_bit.begins_with(".")) {
++	while (true) {
++		const int64_t seg_end = str.find('/', seg_start);
++		if (seg_end == -1) {
++			break; // Last segment is the file name.
++		}
++
++		const Span<char32_t> seg(str.ptr() + seg_start, seg_end - seg_start);
++		if (!seg.is_empty() && seg.ptr()[0] == '.') {
+ 			return false;
+ 		}
+-		const String path_bit_lower = path_bit.to_lower();
+ 
+ 		int idx = -1;
+-		for (int j = 0; j < fs->get_subdir_count(); j++) {
+-			if (is_case_sensitive) {
+-				if (fs->get_subdir(j)->get_name() == path_bit) {
+-					idx = j;
+-					break;
+-				}
+-			} else {
+-				if (fs->get_subdir(j)->get_name().to_lower() == path_bit_lower) {
+-					idx = j;
+-					break;
+-				}
++		for (int j = 0; j < fs->subdirs.size(); j++) {
++			if (_span_equals(fs->subdirs[j]->name, seg, is_case_sensitive)) {
++				idx = j;
++				break;
+ 			}
+ 		}
+ 
+ 		if (idx == -1) {
++			const String path_bit = String::utf32(seg);
+ 			// Only create a missing directory in memory when it exists on disk.
+-			String dir_path = fs->get_path().path_join(path_bit);
+-			if (!dir->dir_exists(ProjectSettings::get_singleton()->globalize_path(dir_path))) {
++			const String dir_path = fs->get_path().path_join(path_bit);
++			if (!DirAccess::dir_exists_absolute(dir_path) || _should_skip_directory(dir_path)) {
+ 				return false;
+ 			}
+ 			EditorFileSystemDirectory *efsd = memnew(EditorFileSystemDirectory);
+@@ -1973,22 +2008,19 @@ bool EditorFileSystem::_find_file(const String &p_file, EditorFileSystemDirector
+ 			}
+ 			fs = efsd;
+ 		} else {
+-			fs = fs->get_subdir(idx);
++			fs = fs->subdirs[idx];
+ 		}
++
++		seg_start = seg_end + 1;
+ 	}
+ 
++	const Span<char32_t> file(str.ptr() + seg_start, str.size() - seg_start);
++
+ 	int cpos = -1;
+ 	for (int i = 0; i < fs->files.size(); i++) {
+-		if (is_case_sensitive) {
+-			if (fs->files[i]->file == file) {
+-				cpos = i;
+-				break;
+-			}
+-		} else {
+-			if (fs->files[i]->file.to_lower() == file_lower) {
+-				cpos = i;
+-				break;
+-			}
++		if (_span_equals(fs->files[i]->file, file, is_case_sensitive)) {
++			cpos = i;
++			break;
+ 		}
+ 	}
+ 
+@@ -3376,6 +3408,7 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
+ 					WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(this, &EditorFileSystem::_reimport_thread, &tdata, item_count, -1, false, vformat(TTR("Import resources of type: %s"), reimport_files[from].importer));
+ 
+ 					int imported_count = 0;
++
+ 					while (true) {
+ 						uint32_t processed = WorkerThreadPool::get_singleton()->get_group_processed_element_count(group_task);
+ 						for (; imported_count < (int)processed; imported_count++) {
+diff --git a/platform/macos/dir_access_macos.mm b/platform/macos/dir_access_macos.mm
+index 4d691025..a9dab81b 100644
+--- a/platform/macos/dir_access_macos.mm
++++ b/platform/macos/dir_access_macos.mm
+@@ -36,7 +36,9 @@
+ 
+ #import <AppKit/NSWorkspace.h>
+ #import <Foundation/Foundation.h>
++#include <sys/attr.h>
+ #include <sys/mount.h>
++#include <unistd.h>
+ 
+ #include <cerrno>
+ 
+@@ -81,13 +83,28 @@ String DirAccessMacOS::get_drive(int p_drive) {
+ }
+ 
+ bool DirAccessMacOS::is_hidden(const String &p_name) {
+-	String f = get_current_dir().path_join(p_name);
+-	NSURL *url = [NSURL fileURLWithPath:@(f.utf8().get_data())];
+-	NSNumber *hidden = nil;
+-	if (![url getResourceValue:&hidden forKey:NSURLIsHiddenKey error:nil]) {
++	// Only called from get_next(), so p_name is relative to the open dir_stream.
++	ERR_FAIL_NULL_V(dir_stream, false);
++
++	// Same rule as NSURLIsHiddenKey: the real name starts with a dot, or the UF_HIDDEN flag is set.
++	// Using the real name makes "." and ".." follow the directory they refer to.
++	struct attrlist attrs = {};
++	attrs.bitmapcount = ATTR_BIT_MAP_COUNT;
++	attrs.commonattr = ATTR_CMN_NAME | ATTR_CMN_FLAGS;
++
++	struct __attribute__((packed)) {
++		uint32_t length;
++		attrreference_t name_ref;
++		uint32_t flags;
++		char name[NAME_MAX * 3 + 1];
++	} buf;
++
++	if (getattrlistat(dirfd(dir_stream), p_name.utf8().get_data(), &attrs, &buf, sizeof(buf), FSOPT_NOFOLLOW) != 0) {
+ 		return DirAccessUnix::is_hidden(p_name);
+ 	}
+-	return [hidden boolValue];
++
++	const char *real_name = (const char *)&buf.name_ref + buf.name_ref.attr_dataoffset;
++	return real_name[0] == '.' || (buf.flags & UF_HIDDEN) != 0;
+ }
+ 
+ bool DirAccessMacOS::is_case_sensitive(const String &p_path) const {
+-- 
+2.43.0
+

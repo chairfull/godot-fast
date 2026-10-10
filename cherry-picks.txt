@@ -1,0 +1,31 @@
+# Cherry-pick manifest for zlf-godot-editor
+#
+# Pinned base: godotengine/godot master @ 232e6b14abf6e590b41d60f11704e42de22bff72
+# (4.8-dev, 2026-10-09)
+#
+# The patches/ directory contains the resolved patch series, generated with
+# `git format-patch` from a locally resolved cherry-pick. They are applied in
+# CI with `git am patches/*.patch` in filename order.
+#
+# Two PRs needed manual conflict resolution against current master:
+# - #121827 2/7 (glTF parallel parsing): upstream moved the attributes check
+#   and added material _gen_unique_name between July and October; ported both
+#   into _parse_single_mesh (name gen serialized via the material mutex).
+# - #124138 vs #121827 in editor_file_system.cpp: both rewrote the reimport
+#   wait loop; kept #121827's threaded version (already has the correct
+#   from + imported_count indexing).
+
+PR #121827 — Editor: Threaded scene imports and parallel glTF/mesh processing (knopkem)
+  0001  4d4924c1  Dummy renderer: Make RID owners thread-safe
+  0002  ee7302a9  glTF: Parse meshes in parallel                    (manually resolved)
+  0003  e8827649  Editor: Import scenes on multiple threads
+  0004  ae3c9894  Fix worker thread detection in parallel mesh processing
+  0005  28abb828  RenderingServer: Make the redraw change counter atomic
+  0006  03f332af  Editor: Serialize scene format importer option queries
+  0007  18168ae8  Editor: Fall back to serial scene import when user code is involved
+
+PR #122860 — Make the editor only update what actually relates to changed project settings (adamscott)
+  0008  3b12c468  (micro-opt, applies cleanly)
+
+PR #124138 — editor: Improve filesystem dock and import performance (stuartcarnie)
+  0009  51cbd486                                                (manually resolved)

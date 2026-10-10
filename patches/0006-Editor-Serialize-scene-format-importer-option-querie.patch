@@ -1,0 +1,30 @@
+From 03374eefa6926fb8a392916aad94d12e535b931d Mon Sep 17 00:00:00 2001
+From: Michael Knopke <knopkem@gmail.com>
+Date: Mon, 27 Jul 2026 15:24:59 +0200
+Subject: [PATCH 6/9] Editor: Serialize scene format importer option queries
+
+EditorSceneFormatImporter instances are shared and keep scratch state
+(current_option_list) while building the import option list. With
+threaded scene imports, concurrent get_import_options() calls raced on
+it. Found with ThreadSanitizer.
+---
+ editor/import/3d/resource_importer_scene.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/editor/import/3d/resource_importer_scene.cpp b/editor/import/3d/resource_importer_scene.cpp
+index f7e7f9ca..7ec72175 100644
+--- a/editor/import/3d/resource_importer_scene.cpp
++++ b/editor/import/3d/resource_importer_scene.cpp
+@@ -2734,6 +2734,9 @@ void ResourceImporterScene::get_import_options(const String &p_path, List<Import
+ 
+ 	_plugins_get_import_options(p_path, r_options);
+ 
++	// Scene format importers are shared instances holding scratch state
++	// (current_option_list), so serialize access during threaded imports.
++	MutexLock lock(post_import_mutex);
+ 	for (Ref<EditorSceneFormatImporter> importer_elem : scene_importers) {
+ 		importer_elem->get_import_options(p_path, r_options);
+ 	}
+-- 
+2.43.0
+

@@ -1,0 +1,130 @@
+From c310aa0f066a5942c3332c46caf88e6a27ebe73c Mon Sep 17 00:00:00 2001
+From: Michael Knopke <knopkem@gmail.com>
+Date: Mon, 27 Jul 2026 16:03:44 +0200
+Subject: [PATCH 7/9] Editor: Fall back to serial scene import when user code
+ is involved
+
+Threaded scene imports execute post-import scripts and plugins on
+worker threads. Even though their execution is serialized with a
+mutex, user code written with the assumption of running on the main
+thread can still misbehave.
+
+Conservatively fall back to serial import in those cases:
+
+- ResourceImporterScene::can_import_threaded() now returns false
+  whenever any post-import plugin is registered.
+- A new per-file hook, ResourceImporter::can_import_file_threaded(),
+  lets the scene importer exclude files that have a post-import
+  script configured, while everything else still imports in parallel.
+---
+ core/io/resource_importer.cpp                |  2 +-
+ core/io/resource_importer.h                  |  2 ++
+ editor/import/3d/resource_importer_scene.cpp | 16 ++++++++++++++++
+ editor/import/3d/resource_importer_scene.h   |  6 +++++-
+ tests/scene/test_resource_importer_scene.cpp | 13 +++++++++++++
+ 5 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/core/io/resource_importer.cpp b/core/io/resource_importer.cpp
+index 41a99df7..f232dbb8 100644
+--- a/core/io/resource_importer.cpp
++++ b/core/io/resource_importer.cpp
+@@ -273,7 +273,7 @@ Error ResourceFormatImporter::get_import_order_threads_and_importer(const String
+ 	if (importer.is_valid()) {
+ 		r_order = importer->get_import_order();
+ 		r_importer = importer->get_importer_name();
+-		r_can_threads = importer->can_import_threaded();
++		r_can_threads = importer->can_import_file_threaded(p_path);
+ 		return OK;
+ 	} else {
+ 		return ERR_INVALID_PARAMETER;
+diff --git a/core/io/resource_importer.h b/core/io/resource_importer.h
+index f32cac6e..e99d99e6 100644
+--- a/core/io/resource_importer.h
++++ b/core/io/resource_importer.h
+@@ -156,6 +156,8 @@ public:
+ 
+ 	virtual Error import(ResourceUID::ID p_source_id, const String &p_source_file, const String &p_save_path, const HashMap<StringName, Variant> &p_options, List<String> *r_platform_variants, List<String> *r_gen_files = nullptr, Variant *r_metadata = nullptr) = 0;
+ 	virtual bool can_import_threaded() const { return false; }
++	// Per-file variant of can_import_threaded(); defaults to the importer-wide setting.
++	virtual bool can_import_file_threaded(const String &p_path) const { return can_import_threaded(); }
+ 	virtual void import_threaded_begin() {}
+ 	virtual void import_threaded_end() {}
+ 
+diff --git a/editor/import/3d/resource_importer_scene.cpp b/editor/import/3d/resource_importer_scene.cpp
+index 7ec72175..395b3f11 100644
+--- a/editor/import/3d/resource_importer_scene.cpp
++++ b/editor/import/3d/resource_importer_scene.cpp
+@@ -31,6 +31,7 @@
+ #include "resource_importer_scene.h"
+ 
+ #include "core/error/error_macros.h"
++#include "core/io/config_file.h"
+ #include "core/io/dir_access.h"
+ #include "core/io/resource_loader.h"
+ #include "core/io/resource_saver.h"
+@@ -3707,6 +3708,21 @@ void ResourceImporterScene::_plugins_get_import_options(const String &p_path, Li
+ 	}
+ }
+ 
++bool ResourceImporterScene::can_import_file_threaded(const String &p_path) const {
++	if (!can_import_threaded()) {
++		return false;
++	}
++	// Files with a post-import script run user code during import; import them on the main thread.
++	if (FileAccess::exists(p_path + ".import")) {
++		Ref<ConfigFile> cf;
++		cf.instantiate();
++		if (cf->load(p_path + ".import") == OK && !String(cf->get_value("params/import_script/path", "")).is_empty()) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ void ResourceImporterScene::import_threaded_begin() {
+ 	MutexLock lock(post_import_mutex);
+ 	pending_scene_previews.clear();
+diff --git a/editor/import/3d/resource_importer_scene.h b/editor/import/3d/resource_importer_scene.h
+index d6b30dc1..53ed16b7 100644
+--- a/editor/import/3d/resource_importer_scene.h
++++ b/editor/import/3d/resource_importer_scene.h
+@@ -293,7 +293,11 @@ public:
+ 	virtual void handle_compatibility_options(HashMap<StringName, Variant> &p_import_params) const override;
+ 	// Import scenes *after* everything else (such as textures).
+ 	virtual int get_import_order() const override { return ResourceImporter::IMPORT_ORDER_SCENE; }
+-	virtual bool can_import_threaded() const override { return true; }
++	// Threaded scene import is disabled whenever user-provided post-import plugins are
++	// registered, as their code is not expected to be thread-safe.
++	virtual bool can_import_threaded() const override { return post_importer_plugins.is_empty(); }
++	// Files with a post-import script run user code during import; import them on the main thread.
++	virtual bool can_import_file_threaded(const String &p_path) const override;
+ 	virtual void import_threaded_begin() override;
+ 	virtual void import_threaded_end() override;
+ 
+diff --git a/tests/scene/test_resource_importer_scene.cpp b/tests/scene/test_resource_importer_scene.cpp
+index 9a0d09e1..c873c6c4 100644
+--- a/tests/scene/test_resource_importer_scene.cpp
++++ b/tests/scene/test_resource_importer_scene.cpp
+@@ -47,6 +47,19 @@ TEST_CASE("[Editor][ResourceImporterScene] Threaded import support") {
+ 
+ 	// Verify import order is set to SCENE (processed after textures and other fast assets).
+ 	CHECK(importer.get_import_order() == ResourceImporter::IMPORT_ORDER_SCENE);
++
++	// Files without a post-import script can be imported threaded.
++	CHECK(importer.can_import_file_threaded("res://some_file_without_import.glb"));
++
++	// Registering a post-import plugin disables threaded scene imports,
++	// as plugin code is not expected to be thread-safe.
++	Ref<EditorScenePostImportPlugin> plugin;
++	plugin.instantiate();
++	ResourceImporterScene::add_post_importer_plugin(plugin);
++	CHECK(!importer.can_import_threaded());
++	CHECK(!importer.can_import_file_threaded("res://some_file_without_import.glb"));
++	ResourceImporterScene::remove_post_importer_plugin(plugin);
++	CHECK(importer.can_import_threaded());
+ }
+ 
+ } // namespace TestResourceImporterScene
+-- 
+2.43.0
+

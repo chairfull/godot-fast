@@ -1,0 +1,33 @@
+From c225d034b16caec6900b3a0d51c4aa369842fec4 Mon Sep 17 00:00:00 2001
+From: Michael Knopke <knopkem@gmail.com>
+Date: Mon, 27 Jul 2026 14:21:18 +0200
+Subject: [PATCH 1/9] Dummy renderer: Make RID owners thread-safe
+
+RID_Alloc only locks its mutex when the owner is declared with
+THREAD_SAFE = true. The dummy renderer's owners were all declared
+without it, so concurrent RID allocation from multiple threads raced
+and could hand out the same RID twice, corrupting resources.
+
+This can happen whenever resources are created from worker threads in
+headless mode (e.g. threaded resource loading or threaded imports),
+which the threaded scene import now exercises heavily.
+---
+ servers/rendering/dummy/storage/light_storage.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/servers/rendering/dummy/storage/light_storage.h b/servers/rendering/dummy/storage/light_storage.h
+index 6be1c0b1..50eb6ec3 100644
+--- a/servers/rendering/dummy/storage/light_storage.h
++++ b/servers/rendering/dummy/storage/light_storage.h
+@@ -50,7 +50,7 @@ private:
+ 		RID lightmap;
+ 	};
+ 
+-	mutable RID_Owner<LightmapInstance> lightmap_instance_owner;
++	mutable RID_Owner<LightmapInstance, true> lightmap_instance_owner;
+ 
+ public:
+ 	static LightStorage *get_singleton();
+-- 
+2.43.0
+
