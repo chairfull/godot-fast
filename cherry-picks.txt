@@ -29,3 +29,10 @@ PR #122860 — Make the editor only update what actually relates to changed proj
 
 PR #124138 — editor: Improve filesystem dock and import performance (stuartcarnie)
   0009  51cbd486                                                (manually resolved)
+
+Custom patch — Editor: Compile scripts documentation on multiple threads (zlf, no upstream PR)
+  0010  (new)     Parallelizes EditorFileSystem::_update_script_documentation()
+                  via WorkerThreadPool on first scan (>=16 scripts). Each worker
+                  compiles one script/scene and collects its ClassDocs; doc
+                  registration stays on the calling thread. Verified to apply
+                  cleanly with `git am` after 0001-0009 on the pinned base.

@@ -1,0 +1,190 @@
+From 2678af1b328abbf1a35f04ad483c9fccfbc0acf5 Mon Sep 17 00:00:00 2001
+From: zlf <zlf@local>
+Date: Sat, 10 Oct 2026 07:52:18 -0400
+Subject: [PATCH] Editor: Compile scripts documentation on multiple threads
+
+---
+ editor/file_system/editor_file_system.cpp | 134 ++++++++++++++++++++++
+ editor/file_system/editor_file_system.h   |   9 ++
+ 2 files changed, 143 insertions(+)
+
+diff --git a/editor/file_system/editor_file_system.cpp b/editor/file_system/editor_file_system.cpp
+index c9996e8..a74509a 100644
+--- a/editor/file_system/editor_file_system.cpp
++++ b/editor/file_system/editor_file_system.cpp
+@@ -2198,11 +2198,145 @@ void EditorFileSystem::_update_script_classes() {
+ 	ResourceSaver::add_custom_savers();
+ }
+ 
++void EditorFileSystem::_script_doc_thread(uint32_t p_index, ScriptDocThreadData *p_data) {
++	ScriptDocThreadData &d = p_data[p_index];
++
++	if (d.is_scene) {
++		Ref<PackedScene> packed_scene = ResourceLoader::load(d.path);
++		if (packed_scene.is_valid()) {
++			Ref<SceneState> state = packed_scene->get_state();
++			if (state.is_valid()) {
++				Vector<Ref<Resource>> sub_resources = state->get_sub_resources();
++				for (Ref<Resource> sub_resource : sub_resources) {
++					Ref<Script> scr = sub_resource;
++					if (scr.is_valid()) {
++						for (const DocData::ClassDoc &cd : scr->get_documentation()) {
++							d.docs.push_back(cd);
++						}
++					}
++				}
++			}
++		}
++		return;
++	}
++
++	Ref<Script> scr = ResourceLoader::load(d.path);
++	if (scr.is_null()) {
++		return;
++	}
++	if (d.should_reload) {
++		// Reloading the script from disk. Otherwise, the ResourceLoader::load will
++		// return the last loaded version of the script (without the modifications).
++		scr->reload_from_file();
++	}
++	d.docs = scr->get_documentation();
++}
++
++void EditorFileSystem::_update_script_documentation_threaded() {
++	// Pre-resolve file info on the calling thread; the directory tree must
++	// not be accessed from worker threads.
++	Vector<ScriptDocThreadData> thread_data;
++	thread_data.reserve(update_script_paths_documentation.size());
++
++	{
++		MutexLock update_script_lock(update_script_mutex);
++
++		for (const String &path : update_script_paths_documentation) {
++			int index = -1;
++			EditorFileSystemDirectory *efd = find_file(path, &index);
++
++			if (!efd || index < 0) {
++				// The file was removed.
++				EditorHelp::remove_script_doc_by_path(path);
++				continue;
++			}
++
++			ScriptDocThreadData d;
++			d.path = path;
++
++			if (path.ends_with(".tscn")) {
++				d.is_scene = true;
++			} else {
++				bool supported = false;
++				for (int i = 0; i < ScriptServer::get_language_count(); i++) {
++					ScriptLanguage *lang = ScriptServer::get_language(i);
++					if (lang->supports_documentation() && efd->files[index]->type == lang->get_type()) {
++						supported = true;
++						break;
++					}
++				}
++				if (!supported) {
++					continue;
++				}
++				d.should_reload = _should_reload_script(path);
++			}
++
++			thread_data.push_back(d);
++		}
++
++		update_script_paths_documentation.clear();
++	}
++
++	if (thread_data.is_empty()) {
++		return;
++	}
++
++	EditorProgress *ep = nullptr;
++	if (thread_data.size() > 1) {
++		ep = memnew(EditorProgress("update_script_paths_documentation", TTR("Updating scripts documentation"), thread_data.size(), false, true));
++	}
++
++	WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(
++			this, &EditorFileSystem::_script_doc_thread,
++			thread_data.ptr(), thread_data.size(), -1, false,
++			vformat(TTR("Updating scripts documentation (%d files)"), thread_data.size()));
++
++	// Poll progress on the calling thread while the workers compile scripts.
++	uint32_t completed_count = 0;
++	while (completed_count < (uint32_t)thread_data.size()) {
++		uint32_t processed = WorkerThreadPool::get_singleton()->get_group_processed_element_count(group_task);
++		if (ep) {
++			for (; completed_count < processed; completed_count++) {
++				ep->step(thread_data[completed_count].path.get_file(), completed_count, false);
++			}
++		} else {
++			completed_count = processed;
++		}
++		if (completed_count < (uint32_t)thread_data.size()) {
++			OS::get_singleton()->delay_usec(1000);
++		}
++	}
++
++	WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
++
++	// Register the generated documentation on the calling thread;
++	// EditorHelp is not thread-safe.
++	for (const ScriptDocThreadData &d : thread_data) {
++		for (const DocData::ClassDoc &cd : d.docs) {
++			EditorHelp::add_doc(cd);
++			if (!first_scan) {
++				// Update the documentation in the Script Editor if it is open.
++				ScriptEditor::get_singleton()->update_doc(cd.name);
++			}
++		}
++	}
++
++	memdelete(ep);
++}
++
+ void EditorFileSystem::_update_script_documentation() {
+ 	if (update_script_paths_documentation.is_empty()) {
+ 		return;
+ 	}
+ 
++	// On the first scan (fresh project open) every script must be compiled to
++	// generate documentation. Parallelize it; the single-threaded loop below
++	// is the slowest part of opening a project with many scripts.
++	if (first_scan && update_script_paths_documentation.size() >= 16) {
++		_update_script_documentation_threaded();
++		return;
++	}
++
+ 	MutexLock update_script_lock(update_script_mutex);
+ 
+ 	EditorProgress *ep = nullptr;
+diff --git a/editor/file_system/editor_file_system.h b/editor/file_system/editor_file_system.h
+index 45c0397..c445fdb 100644
+--- a/editor/file_system/editor_file_system.h
++++ b/editor/file_system/editor_file_system.h
+@@ -32,6 +32,7 @@
+ 
+ #include "core/io/dir_access.h"
+ #include "core/io/resource_loader_constants.h"
++#include "core/doc_data.h"
+ #include "core/os/semaphore.h"
+ #include "core/os/thread.h"
+ #include "core/os/thread_safe.h"
+@@ -319,6 +320,14 @@ class EditorFileSystem : public Node {
+ 	void _queue_update_script_class(const String &p_path, const ScriptClassInfoUpdate &p_script_update);
+ 	void _update_script_classes();
+ 	void _update_script_documentation();
++	struct ScriptDocThreadData {
++		String path;
++		bool is_scene = false;
++		bool should_reload = false;
++		Vector<DocData::ClassDoc> docs;
++	};
++	void _update_script_documentation_threaded();
++	void _script_doc_thread(uint32_t p_index, ScriptDocThreadData *p_data);
+ 	void _process_update_pending();
+ 	void _process_removed_files(const HashSet<String> &p_processed_files);
+ 	bool _should_reload_script(const String &p_path);
+-- 
+2.43.0
+
