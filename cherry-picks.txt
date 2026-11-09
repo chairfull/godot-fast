@@ -36,3 +36,21 @@ Custom patch — Editor: Compile scripts documentation on multiple threads (zlf,
                   compiles one script/scene and collects its ClassDocs; doc
                   registration stays on the calling thread. Verified to apply
                   cleanly with `git am` after 0001-0009 on the pinned base.
+
+PR #125234 — Refactor cluster logic (Ansraer) — RUNTIME renderer change
+  0011  09735a3b  Forward+ clustered rendering rewrite: replaces the 32
+                  per-tile z-slices with global z-bins (up to ~8k at ~0.5 m),
+                  CPU-filled, tighter light culling, less VRAM. Supersedes
+                  #125017. Author benchmarks (RTX 5080, 200 omni + 200 spot):
+                  1080p frame 3.86 -> 2.7 ms, 4K 12.3 -> 8.4 ms.
+                  First non-editor pick: the old editor-only rule was retired
+                  2026-11-07 (user call) — the test is measured FPS gain vs
+                  risk/rebase cost. Applies CLEANLY with `git am` after
+                  0001-0010 on the pinned base (verified 2026-11-09, no manual
+                  resolution), and all 5 touched C++ translation units
+                  (cluster_builder_rd, fog, render_forward_clustered,
+                  light_storage, texture_storage) compile against the base.
+                  GLSL changes compile only at runtime — first real run is
+                  the check. Because this ships in the game, CI now also
+                  builds Linux export templates (template_debug/release)
+                  with the same patch series from v0.3.0 on.

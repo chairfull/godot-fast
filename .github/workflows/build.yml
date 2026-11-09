@@ -66,3 +66,62 @@ jobs:
           body: |
             Custom Godot 4.8-dev editor for Linux with cherry-picked performance PRs.
             See cherry-picks.txt for the exact base commit and PR list.
+
+  # Export templates from the SAME patch series, so runtime picks (e.g.
+  # #125234 cluster refactor) reach exported games, not just editor play.
+  # Separate job on purpose: a template build failure must not block the
+  # editor release above.
+  templates:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out zlf-godot-editor
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libx11-dev libxcursor-dev libxinerama-dev \
+            libgl1-mesa-dev libglu1-mesa-dev \
+            libasound2-dev libpulse-dev libudev-dev \
+            libxi-dev libxrandr-dev \
+            libwayland-dev wayland-protocols \
+            python3 python3-pip
+          pip3 install --break-system-packages scons
+
+      - name: Clone Godot at pinned base
+        run: |
+          git init godot && cd godot
+          git remote add origin https://github.com/godotengine/godot.git
+          git fetch --depth 1 origin "$GODOT_BASE_SHA"
+          git checkout FETCH_HEAD
+          git log --oneline -1
+
+      - name: Apply performance patches
+        run: |
+          cd godot
+          git config user.email "zlf-godot-editor@local"
+          git config user.name "zlf-godot-editor"
+          git am ../patches/*.patch
+          git log --oneline -12
+
+      - name: Build export templates
+        run: |
+          cd godot
+          scons platform=linuxbsd target=template_release -j"$(nproc)"
+          scons platform=linuxbsd target=template_debug -j"$(nproc)"
+          ls -la bin/
+
+      - name: Rename templates
+        run: |
+          cp godot/bin/godot.linuxbsd.template_release.x86_64 ./zlf-godot-template_release-linux-x86_64
+          cp godot/bin/godot.linuxbsd.template_debug.x86_64 ./zlf-godot-template_debug-linux-x86_64
+          chmod +x ./zlf-godot-template_release-linux-x86_64 ./zlf-godot-template_debug-linux-x86_64
+          ls -la ./zlf-godot-template_*
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            zlf-godot-template_release-linux-x86_64
+            zlf-godot-template_debug-linux-x86_64

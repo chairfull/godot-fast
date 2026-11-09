@@ -1,0 +1,1769 @@
+From 09735a3bf8aa1b4ec3bc20b2eb7c46b57ef294bf Mon Sep 17 00:00:00 2001
+From: Ansraer <lang.jakob@proton.me>
+Date: Sat, 7 Nov 2026 20:15:21 +0100
+Subject: [PATCH] refactor cluster logic
+
+---
+ .../renderer_rd/cluster_builder_rd.cpp        | 154 +++++++---------
+ .../renderer_rd/cluster_builder_rd.h          | 164 ++++++------------
+ .../rendering/renderer_rd/environment/fog.cpp |  21 ++-
+ .../rendering/renderer_rd/environment/fog.h   |  19 +-
+ .../render_forward_clustered.cpp              |  28 +--
+ .../render_forward_clustered.h                |  13 +-
+ .../renderer_rd/shaders/cluster_debug.glsl    |  44 ++---
+ .../renderer_rd/shaders/cluster_render.glsl   |  95 ++++------
+ .../renderer_rd/shaders/cluster_store.glsl    | 119 -------------
+ .../environment/volumetric_fog_process.glsl   |  52 +++---
+ .../scene_forward_clustered.glsl              |  68 ++++----
+ .../scene_forward_clustered_inc.glsl          |  13 +-
+ .../renderer_rd/storage_rd/light_storage.cpp  |  15 +-
+ .../renderer_rd/storage_rd/light_storage.h    |   5 +-
+ .../renderer_rd/storage_rd/render_data_rd.h   |   2 +-
+ .../storage_rd/texture_storage.cpp            |  10 +-
+ .../renderer_rd/storage_rd/texture_storage.h  |   5 +-
+ 17 files changed, 325 insertions(+), 502 deletions(-)
+ delete mode 100644 servers/rendering/renderer_rd/shaders/cluster_store.glsl
+
+diff --git a/servers/rendering/renderer_rd/cluster_builder_rd.cpp b/servers/rendering/renderer_rd/cluster_builder_rd.cpp
+index 1df4b6054d56c..b543e2a688228 100644
+--- a/servers/rendering/renderer_rd/cluster_builder_rd.cpp
++++ b/servers/rendering/renderer_rd/cluster_builder_rd.cpp
+@@ -93,14 +93,6 @@ ClusterBuilderSharedDataRD::ClusterBuilderSharedDataRD() {
+ #endif
+ 		cluster_render.shader_pipelines[ClusterRender::PIPELINE_MSAA] = RD::get_singleton()->render_pipeline_create(cluster_render.shader, fb_format, vertex_format, RD::RENDER_PRIMITIVE_TRIANGLES, rasterization_state, ms, RD::PipelineDepthStencilState(), blend_state, 0, 0, specialization_constants);
+ 	}
+-	{
+-		Vector<String> versions;
+-		versions.push_back("");
+-		cluster_store.cluster_store_shader.initialize(versions);
+-		cluster_store.shader_version = cluster_store.cluster_store_shader.version_create();
+-		cluster_store.shader = cluster_store.cluster_store_shader.version_get_shader(cluster_store.shader_version, 0);
+-		cluster_store.shader_pipeline = RD::get_singleton()->compute_pipeline_create(cluster_store.shader);
+-	}
+ 	{
+ 		Vector<String> versions;
+ 		versions.push_back("");
+@@ -247,7 +239,6 @@ ClusterBuilderSharedDataRD::~ClusterBuilderSharedDataRD() {
+ 	RD::get_singleton()->free_rid(box_index_buffer);
+ 
+ 	cluster_render.cluster_render_shader.version_free(cluster_render.shader_version);
+-	cluster_store.cluster_store_shader.version_free(cluster_store.shader_version);
+ 	cluster_debug.cluster_debug_shader.version_free(cluster_debug.shader_version);
+ }
+ 
+@@ -259,10 +250,8 @@ void ClusterBuilderRD::_clear() {
+ 	}
+ 
+ 	RD::get_singleton()->free_rid(cluster_buffer);
+-	RD::get_singleton()->free_rid(cluster_render_buffer);
+ 	RD::get_singleton()->free_rid(element_buffer);
+ 	cluster_buffer = RID();
+-	cluster_render_buffer = RID();
+ 	element_buffer = RID();
+ 
+ 	memfree(render_elements);
+@@ -275,7 +264,45 @@ void ClusterBuilderRD::_clear() {
+ 	framebuffer = RID();
+ 
+ 	cluster_render_uniform_set = RID();
+-	cluster_store_uniform_set = RID();
++}
++
++void ClusterBuilderRD::_add_to_z_bins(ElementType p_type, uint32_t p_index, const Vector2 &p_depth_range) {
++	const float last_bin = z_bin_count - 1;
++	const uint32_t from = (uint32_t)CLAMP((p_depth_range.x - z_near) * z_bin_scale, 0.0f, last_bin);
++	const uint32_t to = (uint32_t)CLAMP((p_depth_range.y - z_near) * z_bin_scale, 0.0f, last_bin);
++
++	const uint32_t type_offset = p_type * z_bin_count;
++	for (uint32_t i = from; i <= to; i++) {
++		uint32_t &bin = z_bins[type_offset + i];
++		// Elements are added in order, so no min/max operations are needed
++		const uint32_t lowest_index = bin != 0 ? (bin & 0xFFFF) : p_index;
++		bin = lowest_index | ((p_index + 1) << 16);
++	}
++}
++
++Vector2 ClusterBuilderRD::get_light_depth_range(LightType p_type, const Transform3D &p_view_space_transform, float p_radius, float p_spot_aperture, const Vector2 &p_area_size) {
++	const Vector3 z_axis = p_view_space_transform.basis.get_column(Vector3::AXIS_Z);
++
++	if (p_type == LIGHT_TYPE_AREA) {
++		const Vector3 half_size = _get_area_light_half_size(p_radius, p_area_size);
++		Transform3D box_transform = p_view_space_transform;
++		box_transform.origin -= z_axis * half_size.z;
++		return get_box_depth_range(box_transform, half_size);
++	}
++
++	const real_t depth = -p_view_space_transform.origin.z;
++
++	if (p_type == LIGHT_TYPE_OMNI || p_spot_aperture > WIDE_SPOT_ANGLE_THRESHOLD_DEG) {
++		// omni or spot with wide angle
++		return Vector2(depth - p_radius, depth + p_radius);
++	}
++
++	// spot
++	const real_t cone_axis_z = -z_axis.normalized().z;
++	const real_t base_depth = depth - cone_axis_z * p_radius;
++	const real_t base_radius = Math::tan(Math::deg_to_rad(p_spot_aperture)) * p_radius;
++	const real_t base_half_depth = base_radius * Math::sqrt(MAX(1.0 - cone_axis_z * cone_axis_z, 0.0));
++	return Vector2(MIN(depth, base_depth - base_half_depth), MAX(depth, base_depth + base_half_depth));
+ }
+ 
+ void ClusterBuilderRD::setup(Size2i p_screen_size, uint32_t p_max_elements, RID p_depth_buffer, RID p_depth_buffer_sampler, RID p_color_buffer) {
+@@ -287,24 +314,20 @@ void ClusterBuilderRD::setup(Size2i p_screen_size, uint32_t p_max_elements, RID
+ 
+ 	screen_size = p_screen_size;
+ 
+-	cluster_screen_size.width = Math::division_round_up((uint32_t)p_screen_size.width, cluster_size);
+-	cluster_screen_size.height = Math::division_round_up((uint32_t)p_screen_size.height, cluster_size);
++	screen_size_in_tiles.width = Math::division_round_up((uint32_t)p_screen_size.width, tile_size);
++	screen_size_in_tiles.height = Math::division_round_up((uint32_t)p_screen_size.height, tile_size);
+ 
+ 	max_elements_by_type = p_max_elements;
+ 	if (max_elements_by_type % 32) { // Needs to be aligned to 32.
+ 		max_elements_by_type += 32 - (max_elements_by_type % 32);
+ 	}
+ 
+-	cluster_buffer_size = cluster_screen_size.x * cluster_screen_size.y * (max_elements_by_type / 32 + 32) * ELEMENT_TYPE_MAX * 4;
++	bitmasks_per_type_count = screen_size_in_tiles.x * screen_size_in_tiles.y * (max_elements_by_type / 32);
++	z_bin_offset = bitmasks_per_type_count * ELEMENT_TYPE_MAX;
++	cluster_buffer_size = (z_bin_offset + MAX_Z_BINS * ELEMENT_TYPE_MAX) * sizeof(uint32_t);
+ 
+ 	render_element_max = max_elements_by_type * ELEMENT_TYPE_MAX;
+ 
+-	uint32_t element_tag_bits_size = render_element_max / 32;
+-	uint32_t element_tag_depth_bits_size = render_element_max;
+-
+-	cluster_render_buffer_size = cluster_screen_size.x * cluster_screen_size.y * (element_tag_bits_size + element_tag_depth_bits_size) * 4; // Tag bits (element was used) and tag depth (depth range in which it was used).
+-
+-	cluster_render_buffer = RD::get_singleton()->storage_buffer_create(cluster_render_buffer_size);
+ 	cluster_buffer = RD::get_singleton()->storage_buffer_create(cluster_buffer_size);
+ 
+ 	render_elements = static_cast<RenderElementData *>(memalloc(sizeof(RenderElementData) * render_element_max));
+@@ -339,39 +362,11 @@ void ClusterBuilderRD::setup(Size2i p_screen_size, uint32_t p_max_elements, RID
+ 			RD::Uniform u;
+ 			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+ 			u.binding = 3;
+-			u.append_id(cluster_render_buffer);
+-			uniforms.push_back(u);
+-		}
+-
+-		cluster_render_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, shared->cluster_render.shader, 0);
+-	}
+-
+-	{
+-		Vector<RD::Uniform> uniforms;
+-		{
+-			RD::Uniform u;
+-			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+-			u.binding = 1;
+-			u.append_id(cluster_render_buffer);
+-			uniforms.push_back(u);
+-		}
+-		{
+-			RD::Uniform u;
+-			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+-			u.binding = 2;
+ 			u.append_id(cluster_buffer);
+ 			uniforms.push_back(u);
+ 		}
+ 
+-		{
+-			RD::Uniform u;
+-			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+-			u.binding = 3;
+-			u.append_id(element_buffer);
+-			uniforms.push_back(u);
+-		}
+-
+-		cluster_store_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, shared->cluster_store.shader, 0);
++		cluster_render_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, shared->cluster_render.shader, 0);
+ 	}
+ 
+ 	if (p_color_buffer.is_valid()) {
+@@ -428,11 +423,15 @@ void ClusterBuilderRD::begin(const Transform3D &p_view_transform, const Projecti
+ 	projection = correction * projection;
+ 	adjusted_projection = correction * adjusted_projection;
+ 
++	z_bin_count = get_z_bin_count(z_near, z_far);
++	z_bin_scale = get_z_bin_scale(z_near, z_far);
++
+ 	// Reset counts.
+ 	render_element_count = 0;
+ 	for (uint32_t i = 0; i < ELEMENT_TYPE_MAX; i++) {
+ 		cluster_count_by_type[i] = 0;
+ 	}
++	memset(z_bins.ptr(), 0, z_bin_count * ELEMENT_TYPE_MAX * sizeof(uint32_t));
+ }
+ 
+ void ClusterBuilderRD::bake_cluster() {
+@@ -444,21 +443,19 @@ void ClusterBuilderRD::bake_cluster() {
+ 	RD::get_singleton()->buffer_clear(cluster_buffer, 0, cluster_buffer_size);
+ 
+ 	if (render_element_count > 0) {
+-		// Clear render buffer.
+-		RD::get_singleton()->buffer_clear(cluster_render_buffer, 0, cluster_render_buffer_size);
++		RD::get_singleton()->buffer_update(cluster_buffer, z_bin_offset * sizeof(uint32_t), z_bin_count * ELEMENT_TYPE_MAX * sizeof(uint32_t), z_bins.ptr());
+ 
+ 		{ // Fill state uniform.
+ 
+ 			StateUniform state;
+ 
+ 			RendererRD::MaterialStorage::store_camera(adjusted_projection, state.projection);
+-			state.inv_z_far = 1.0 / z_far;
+-			state.screen_to_clusters_shift = Math::get_shift_from_power_of_2(cluster_size);
+-			state.screen_to_clusters_shift -= divisor; //screen is smaller, shift one less
++			state.screen_to_tiles_shift = Math::get_shift_from_power_of_2(tile_size);
++			state.screen_to_tiles_shift -= divisor; //screen is smaller, shift one less
+ 
+-			state.cluster_screen_width = cluster_screen_size.x;
+-			state.cluster_depth_offset = (render_element_max / 32);
+-			state.cluster_data_size = state.cluster_depth_offset + render_element_max;
++			state.tiles_per_row = screen_size_in_tiles.x;
++			state.bitmasks_per_tile_count = max_elements_by_type / 32;
++			state.bitmasks_per_type_count = bitmasks_per_type_count;
+ 
+ 			RD::get_singleton()->buffer_update(state_uniform, 0, sizeof(StateUniform), &state);
+ 		}
+@@ -515,31 +512,6 @@ void ClusterBuilderRD::bake_cluster() {
+ 			}
+ 			RD::get_singleton()->draw_list_end();
+ 		}
+-		// Store elements.
+-		RENDER_TIMESTAMP("Pack 3D Cluster Elements");
+-
+-		{
+-			RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+-			RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, shared->cluster_store.shader_pipeline);
+-			RD::get_singleton()->compute_list_bind_uniform_set(compute_list, cluster_store_uniform_set, 0);
+-
+-			ClusterBuilderSharedDataRD::ClusterStore::PushConstant push_constant;
+-			push_constant.cluster_render_data_size = render_element_max / 32 + render_element_max;
+-			push_constant.max_render_element_count_div_32 = render_element_max / 32;
+-			push_constant.cluster_screen_size[0] = cluster_screen_size.x;
+-			push_constant.cluster_screen_size[1] = cluster_screen_size.y;
+-
+-			push_constant.render_element_count_div_32 = Math::division_round_up(render_element_count, 32U);
+-			push_constant.max_cluster_element_count_div_32 = max_elements_by_type / 32;
+-			push_constant.pad1 = 0;
+-			push_constant.pad2 = 0;
+-
+-			RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(ClusterBuilderSharedDataRD::ClusterStore::PushConstant));
+-
+-			RD::get_singleton()->compute_list_dispatch_threads(compute_list, cluster_screen_size.x, cluster_screen_size.y, 1);
+-
+-			RD::get_singleton()->compute_list_end();
+-		}
+ 	}
+ 	RENDER_TIMESTAMP("< Bake 3D Cluster");
+ 	RD::get_singleton()->draw_command_end_label();
+@@ -554,14 +526,17 @@ void ClusterBuilderRD::debug(ElementType p_element) {
+ 	ClusterBuilderSharedDataRD::ClusterDebug::PushConstant push_constant;
+ 	push_constant.screen_size[0] = screen_size.x;
+ 	push_constant.screen_size[1] = screen_size.y;
+-	push_constant.cluster_screen_size[0] = cluster_screen_size.x;
+-	push_constant.cluster_screen_size[1] = cluster_screen_size.y;
+-	push_constant.cluster_shift = Math::get_shift_from_power_of_2(cluster_size);
++	push_constant.screen_size_in_tiles[0] = screen_size_in_tiles.x;
++	push_constant.screen_size_in_tiles[1] = screen_size_in_tiles.y;
++	push_constant.tile_shift = Math::get_shift_from_power_of_2(tile_size);
+ 	push_constant.cluster_type = p_element;
+ 	push_constant.orthogonal = camera_orthogonal;
+ 	push_constant.z_far = z_far;
+ 	push_constant.z_near = z_near;
+-	push_constant.max_cluster_element_count_div_32 = max_elements_by_type / 32;
++	push_constant.bitmasks_per_tile_count = max_elements_by_type / 32;
++	push_constant.z_bin_offset = z_bin_offset;
++	push_constant.z_bin_count = z_bin_count;
++	push_constant.z_bin_scale = z_bin_scale;
+ 
+ 	RD::get_singleton()->compute_list_set_push_constant(compute_list, &push_constant, sizeof(ClusterBuilderSharedDataRD::ClusterDebug::PushConstant));
+ 
+@@ -574,8 +549,8 @@ RID ClusterBuilderRD::get_cluster_buffer() const {
+ 	return cluster_buffer;
+ }
+ 
+-uint32_t ClusterBuilderRD::get_cluster_size() const {
+-	return cluster_size;
++uint32_t ClusterBuilderRD::get_tile_size() const {
++	return tile_size;
+ }
+ 
+ uint32_t ClusterBuilderRD::get_max_cluster_elements() const {
+@@ -588,6 +563,7 @@ void ClusterBuilderRD::set_shared(ClusterBuilderSharedDataRD *p_shared) {
+ 
+ ClusterBuilderRD::ClusterBuilderRD() {
+ 	state_uniform = RD::get_singleton()->uniform_buffer_create(sizeof(StateUniform));
++	z_bins.resize(MAX_Z_BINS * ELEMENT_TYPE_MAX);
+ }
+ 
+ ClusterBuilderRD::~ClusterBuilderRD() {
+diff --git a/servers/rendering/renderer_rd/cluster_builder_rd.h b/servers/rendering/renderer_rd/cluster_builder_rd.h
+index 49b039a997cf1..368f1447ff0fd 100644
+--- a/servers/rendering/renderer_rd/cluster_builder_rd.h
++++ b/servers/rendering/renderer_rd/cluster_builder_rd.h
+@@ -30,9 +30,9 @@
+ 
+ #pragma once
+ 
++#include "core/templates/local_vector.h"
+ #include "servers/rendering/renderer_rd/shaders/cluster_debug.glsl.gen.h"
+ #include "servers/rendering/renderer_rd/shaders/cluster_render.glsl.gen.h"
+-#include "servers/rendering/renderer_rd/shaders/cluster_store.glsl.gen.h"
+ #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
+ 
+ class ClusterBuilderSharedDataRD {
+@@ -87,37 +87,23 @@ class ClusterBuilderSharedDataRD {
+ 		RID shader_pipelines[PIPELINE_MAX];
+ 	} cluster_render;
+ 
+-	struct ClusterStore {
+-		struct PushConstant {
+-			uint32_t cluster_render_data_size; // how much data for a single cluster takes
+-			uint32_t max_render_element_count_div_32; // divided by 32
+-			uint32_t cluster_screen_size[2];
+-			uint32_t render_element_count_div_32; // divided by 32
+-			uint32_t max_cluster_element_count_div_32; // divided by 32
+-
+-			uint32_t pad1;
+-			uint32_t pad2;
+-		};
+-
+-		ClusterStoreShaderRD cluster_store_shader;
+-		RID shader_version;
+-		RID shader;
+-		RID shader_pipeline;
+-	} cluster_store;
+-
+ 	struct ClusterDebug {
+ 		struct PushConstant {
+ 			uint32_t screen_size[2];
+-			uint32_t cluster_screen_size[2];
++			uint32_t screen_size_in_tiles[2];
+ 
+-			uint32_t cluster_shift;
++			uint32_t tile_shift;
+ 			uint32_t cluster_type;
+ 			float z_near;
+ 			float z_far;
+ 
+ 			uint32_t orthogonal;
+-			uint32_t max_cluster_element_count_div_32;
++			uint32_t bitmasks_per_tile_count;
++			uint32_t z_bin_offset;
++			uint32_t z_bin_count;
+ 
++			float z_bin_scale;
++			uint32_t pad0;
+ 			uint32_t pad1;
+ 			uint32_t pad2;
+ 		};
+@@ -136,6 +122,8 @@ class ClusterBuilderSharedDataRD {
+ class ClusterBuilderRD {
+ public:
+ 	static constexpr float WIDE_SPOT_ANGLE_THRESHOLD_DEG = 60.0f;
++	static constexpr float Z_BIN_DEPTH = 0.5f;
++	static constexpr uint32_t MAX_Z_BINS = 8192; // Upper limit on number of bins, once we reach it the bins grow deeper instead
+ 
+ 	enum LightType {
+ 		LIGHT_TYPE_OMNI,
+@@ -162,9 +150,8 @@ class ClusterBuilderRD {
+ 
+ 	struct RenderElementData {
+ 		uint32_t type; // 0-4
+-		uint32_t touches_near;
+-		uint32_t touches_far;
+ 		uint32_t original_index;
++		uint32_t pad[2];
+ 		float transform_inv[12]; // Transposed transform for less space.
+ 		float scale[3];
+ 		uint32_t has_wide_spot_angle;
+@@ -190,38 +177,41 @@ class ClusterBuilderRD {
+ 		DIVISOR_4,
+ 	};
+ 
+-	uint32_t cluster_size = 32;
++	uint32_t tile_size = 32;
+ 	bool use_msaa = true;
+ 	Divisor divisor = DIVISOR_4;
+ 
+ 	Size2i screen_size;
+-	Size2i cluster_screen_size;
++	Size2i screen_size_in_tiles;
+ 
+ 	RID framebuffer;
+-	RID cluster_render_buffer; // Used for creating.
+-	RID cluster_buffer; // Used for rendering.
+-	RID element_buffer; // Used for storing, to hint element touches far plane or near plane.
+-	uint32_t cluster_render_buffer_size = 0;
++	RID cluster_buffer; // SS tile bitmasks of every element type, followed by the Z bins of every element type.
++	RID element_buffer; // Used for rendering the element proxies.
+ 	uint32_t cluster_buffer_size = 0;
++	uint32_t bitmasks_per_type_count = 0; // number of bitmasks of all tiles for one element type
++
++	LocalVector<uint32_t> z_bins; // Each bin packs the lowest element index and the highest one plus one (zero is empty)
++	uint32_t z_bin_offset = 0;
++	uint32_t z_bin_count = 1;
++	float z_bin_scale = 0;
+ 
+ 	RID cluster_render_uniform_set;
+-	RID cluster_store_uniform_set;
+ 
+ 	// Persistent data.
+ 
+ 	void _clear();
++	void _add_to_z_bins(ElementType p_type, uint32_t p_index, const Vector2 &p_depth_range);
++
++	static _FORCE_INLINE_ Vector3 _get_area_light_half_size(float p_radius, const Vector2 &p_area_size) {
++		return Vector3(p_area_size.x / 2.0 + p_radius, p_area_size.y / 2.0 + p_radius, p_radius / 2.0);
++	}
+ 
+ 	struct StateUniform {
+ 		float projection[16];
+-		float inv_z_far;
+-		uint32_t screen_to_clusters_shift; // Shift to obtain coordinates in block indices.
+-		uint32_t cluster_screen_width;
+-		uint32_t cluster_data_size; // How much data is needed for a single cluster.
+-		uint32_t cluster_depth_offset;
+-
+-		uint32_t pad0;
+-		uint32_t pad1;
+-		uint32_t pad2;
++		uint32_t screen_to_tiles_shift; // Shift to obtain coordinates in block indices.
++		uint32_t tiles_per_row;
++		uint32_t bitmasks_per_tile_count; // Number of mask words for a single tile
++		uint32_t bitmasks_per_type_count; // Number of mask words all tiles of one element type take
+ 	};
+ 
+ 	RID state_uniform;
+@@ -229,6 +219,23 @@ class ClusterBuilderRD {
+ 	RID debug_uniform_set;
+ 
+ public:
++	static uint32_t get_z_bin_count(float p_z_near, float p_z_far) {
++		return (uint32_t)CLAMP(Math::ceil((p_z_far - p_z_near) / Z_BIN_DEPTH), 1.0f, (float)MAX_Z_BINS);
++	}
++
++	static float get_z_bin_scale(float p_z_near, float p_z_far) {
++		return MIN(1.0f / Z_BIN_DEPTH, get_z_bin_count(p_z_near, p_z_far) / (p_z_far - p_z_near));
++	}
++
++	// in view space, returned as (near, far)
++	static Vector2 get_box_depth_range(const Transform3D &p_view_space_transform, const Vector3 &p_half_size) {
++		const real_t depth = -p_view_space_transform.origin.z;
++		const real_t half_depth = p_view_space_transform.basis.rows[Vector3::AXIS_Z].abs().dot(p_half_size);
++		return Vector2(depth - half_depth, depth + half_depth);
++	}
++
++	static Vector2 get_light_depth_range(LightType p_type, const Transform3D &p_view_space_transform, float p_radius, float p_spot_aperture, const Vector2 &p_area_size);
++
+ 	void setup(Size2i p_screen_size, uint32_t p_max_elements, RID p_depth_buffer, RID p_depth_buffer_sampler, RID p_color_buffer);
+ 
+ 	void begin(const Transform3D &p_view_transform, const Projection &p_cam_projection, bool p_flip_y);
+@@ -255,6 +262,8 @@ class ClusterBuilderRD {
+ 
+ 		radius *= p_radius;
+ 
++		const Vector2 depth_range = get_light_depth_range(p_type, xform, radius, p_spot_aperture, p_area_size);
++
+ 		// Spotlights with wide angle are trated as Omni lights.
+ 		// If the spot angle is above the threshold, we need a sphere instead of a cone for building the clusters
+ 		// since the cone gets too flat/large (spot angle close to 90 degrees) or
+@@ -262,16 +271,6 @@ class ClusterBuilderRD {
+ 		if (p_type == LIGHT_TYPE_OMNI || (p_type == LIGHT_TYPE_SPOT && p_spot_aperture > WIDE_SPOT_ANGLE_THRESHOLD_DEG)) {
+ 			radius *= shared->sphere_overfit; // Overfit icosphere.
+ 
+-			float depth = -xform.origin.z;
+-			if (camera_orthogonal) {
+-				e.touches_near = (depth - radius) < z_near;
+-			} else {
+-				// Contains camera inside light.
+-				float radius2 = radius * shared->sphere_overfit; // Overfit again for outer size (camera may be outside actual sphere but behind an icosphere vertex)
+-				e.touches_near = xform.origin.length_squared() < radius2 * radius2;
+-			}
+-
+-			e.touches_far = (depth + radius) > z_far;
+ 			e.scale[0] = radius;
+ 			e.scale[1] = radius;
+ 			e.scale[2] = radius;
+@@ -292,36 +291,7 @@ class ClusterBuilderRD {
+ 			radius *= shared->cone_overfit; // Overfit cone.
+ 
+ 			real_t len = Math::tan(Math::deg_to_rad(p_spot_aperture)) * radius;
+-			// Approximate, probably better to use a cone support function.
+-			float max_d = -1e20;
+-			float min_d = 1e20;
+-#define CONE_MINMAX(m_x, m_y) \
+-	{ \
+-		float d = -xform.xform(Vector3(len * m_x, len * m_y, -radius)).z; \
+-		min_d = MIN(d, min_d); \
+-		max_d = MAX(d, max_d); \
+-	}
+-
+-			CONE_MINMAX(1, 1);
+-			CONE_MINMAX(-1, 1);
+-			CONE_MINMAX(-1, -1);
+-			CONE_MINMAX(1, -1);
+-
+-			if (camera_orthogonal) {
+-				e.touches_near = min_d < z_near;
+-			} else {
+-				Plane base_plane(-xform.basis.get_column(Vector3::AXIS_Z), xform.origin);
+-				float dist = base_plane.distance_to(Vector3());
+-				if (dist >= 0 && dist < radius) {
+-					// Contains camera inside light, check angle.
+-					float angle = Math::rad_to_deg(Math::acos((-xform.origin.normalized()).dot(-xform.basis.get_column(Vector3::AXIS_Z))));
+-					e.touches_near = angle < p_spot_aperture * 1.05; //overfit aperture a little due to cone overfit
+-				} else {
+-					e.touches_near = false;
+-				}
+-			}
+ 
+-			e.touches_far = max_d > z_far;
+ 			e.scale[0] = len * shared->cone_overfit;
+ 			e.scale[1] = len * shared->cone_overfit;
+ 			e.scale[2] = radius;
+@@ -333,7 +303,7 @@ class ClusterBuilderRD {
+ 
+ 			cluster_count_by_type[ELEMENT_TYPE_SPOT_LIGHT]++;
+ 		} else { /* LIGHT_TYPE_AREA */
+-			Vector3 scale = Vector3(p_area_size.x / 2.0 + radius, p_area_size.y / 2.0 + radius, radius / 2.0);
++			Vector3 scale = _get_area_light_half_size(radius, p_area_size);
+ 
+ 			for (uint32_t i = 0; i < 3; i++) {
+ 				float s = xform.basis.rows[i].length();
+@@ -342,19 +312,6 @@ class ClusterBuilderRD {
+ 			}
+ 			xform.origin -= xform.basis.get_column(Vector3::AXIS_Z) * scale.z; // translate center to center of box
+ 
+-			float depth = -xform.origin.z;
+-			float box_depth = Math::abs(xform.basis.xform_inv(Vector3(0, 0, -1)).dot(scale));
+-
+-			if (camera_orthogonal) {
+-				e.touches_near = (depth - box_depth) < z_near;
+-			} else {
+-				// Contains camera inside box.
+-				Vector3 inside = xform.xform_inv(Vector3(0, 0, 0)).abs();
+-				e.touches_near = inside.x < scale.x && inside.y < scale.y && inside.z < scale.z;
+-			}
+-
+-			e.touches_far = depth + box_depth > z_far;
+-
+ 			e.scale[0] = scale.x;
+ 			e.scale[1] = scale.y;
+ 			e.scale[2] = scale.z;
+@@ -367,6 +324,8 @@ class ClusterBuilderRD {
+ 			cluster_count_by_type[ELEMENT_TYPE_AREA_LIGHT]++;
+ 		}
+ 
++		_add_to_z_bins((ElementType)e.type, e.original_index, depth_range);
++
+ 		render_element_count++;
+ 	}
+ 
+@@ -381,6 +340,8 @@ class ClusterBuilderRD {
+ 		RenderElementData &e = render_elements[render_element_count];
+ 		Transform3D xform = view_xform * p_transform;
+ 
++		const Vector2 depth_range = get_box_depth_range(xform, p_half_size);
++
+ 		// Extract scale and scale the matrix by it, makes things simpler.
+ 		Vector3 scale = p_half_size;
+ 		for (uint32_t i = 0; i < 3; i++) {
+@@ -389,19 +350,6 @@ class ClusterBuilderRD {
+ 			xform.basis.rows[i] /= s;
+ 		};
+ 
+-		float box_depth = Math::abs(xform.basis.xform_inv(Vector3(0, 0, -1)).dot(scale));
+-		float depth = -xform.origin.z;
+-
+-		if (camera_orthogonal) {
+-			e.touches_near = depth - box_depth < z_near;
+-		} else {
+-			// Contains camera inside box.
+-			Vector3 inside = xform.xform_inv(Vector3(0, 0, 0)).abs();
+-			e.touches_near = inside.x < scale.x && inside.y < scale.y && inside.z < scale.z;
+-		}
+-
+-		e.touches_far = depth + box_depth > z_far;
+-
+ 		e.scale[0] = scale.x;
+ 		e.scale[1] = scale.y;
+ 		e.scale[2] = scale.z;
+@@ -411,6 +359,8 @@ class ClusterBuilderRD {
+ 
+ 		RendererRD::MaterialStorage::store_transform_transposed_3x4(xform, e.transform_inv);
+ 
++		_add_to_z_bins((ElementType)e.type, e.original_index, depth_range);
++
+ 		cluster_count_by_type[e.type]++;
+ 		render_element_count++;
+ 	}
+@@ -424,7 +374,7 @@ class ClusterBuilderRD {
+ 	void debug(ElementType p_element);
+ 
+ 	RID get_cluster_buffer() const;
+-	uint32_t get_cluster_size() const;
++	uint32_t get_tile_size() const;
+ 	uint32_t get_max_cluster_elements() const;
+ 
+ 	void set_shared(ClusterBuilderSharedDataRD *p_shared);
+diff --git a/servers/rendering/renderer_rd/environment/fog.cpp b/servers/rendering/renderer_rd/environment/fog.cpp
+index d55f5c4085ac4..b9adb5dd5ce61 100644
+--- a/servers/rendering/renderer_rd/environment/fog.cpp
++++ b/servers/rendering/renderer_rd/environment/fog.cpp
+@@ -1088,7 +1088,7 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
+ 	params.fog_frustum_size_end[1] = fog_far_size.y;
+ 
+ 	params.ambient_inject = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_ambient_inject(p_settings.env) * RendererSceneRenderRD::get_singleton()->environment_get_ambient_light_energy(p_settings.env);
+-	params.z_far = z_far;
++	params.z_near = z_near;
+ 
+ 	params.fog_frustum_end = fog_end;
+ 
+@@ -1149,14 +1149,17 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
+ 	}
+ 
+ 	{
+-		uint32_t cluster_size = p_settings.cluster_builder->get_cluster_size();
+-		params.cluster_shift = Math::get_shift_from_power_of_2(cluster_size);
+-
+-		uint32_t cluster_screen_width = Math::division_round_up((uint32_t)p_settings.rb_size.x, cluster_size);
+-		uint32_t cluster_screen_height = Math::division_round_up((uint32_t)p_settings.rb_size.y, cluster_size);
+-		params.max_cluster_element_count_div_32 = p_settings.max_cluster_elements / 32;
+-		params.cluster_type_size = cluster_screen_width * cluster_screen_height * (params.max_cluster_element_count_div_32 + 32);
+-		params.cluster_width = cluster_screen_width;
++		uint32_t tile_size = p_settings.cluster_builder->get_tile_size();
++		params.tile_shift = Math::get_shift_from_power_of_2(tile_size);
++
++		uint32_t tiles_per_row = Math::division_round_up((uint32_t)p_settings.rb_size.x, tile_size);
++		uint32_t tiles_per_column = Math::division_round_up((uint32_t)p_settings.rb_size.y, tile_size);
++		params.bitmasks_per_tile_count = p_settings.cluster_builder->get_max_cluster_elements() / 32;
++		params.bitmasks_per_type_count = tiles_per_row * tiles_per_column * params.bitmasks_per_tile_count;
++		params.tiles_per_row = tiles_per_row;
++		params.cluster_z_bin_offset = params.bitmasks_per_type_count * ClusterBuilderRD::ELEMENT_TYPE_MAX;
++		params.cluster_z_bin_count = ClusterBuilderRD::get_z_bin_count(z_near, z_far);
++		params.cluster_z_bin_scale = ClusterBuilderRD::get_z_bin_scale(z_near, z_far);
+ 
+ 		params.screen_size[0] = p_settings.rb_size.x;
+ 		params.screen_size[1] = p_settings.rb_size.y;
+diff --git a/servers/rendering/renderer_rd/environment/fog.h b/servers/rendering/renderer_rd/environment/fog.h
+index 122687ebc2d76..b6f457aeca16e 100644
+--- a/servers/rendering/renderer_rd/environment/fog.h
++++ b/servers/rendering/renderer_rd/environment/fog.h
+@@ -153,7 +153,7 @@ class Fog : public RendererFog {
+ 
+ 			float fog_frustum_end;
+ 			float ambient_inject;
+-			float z_far;
++			float z_near;
+ 			uint32_t filter_axis;
+ 
+ 			float ambient_color[3];
+@@ -171,19 +171,25 @@ class Fog : public RendererFog {
+ 			float detail_spread;
+ 			float gi_inject;
+ 			uint32_t max_voxel_gi_instances;
+-			uint32_t cluster_type_size;
++			uint32_t bitmasks_per_type_count;
+ 
+ 			float screen_size[2];
+-			uint32_t cluster_shift;
+-			uint32_t cluster_width;
++			uint32_t tile_shift;
++			uint32_t tiles_per_row;
+ 
+-			uint32_t max_cluster_element_count_div_32;
++			uint32_t bitmasks_per_tile_count;
+ 			uint32_t use_temporal_reprojection;
+ 			uint32_t temporal_frame;
+ 			float temporal_blend;
+ 
+ 			float sky_border_size[2];
+-			float pad[2];
++			uint32_t cluster_z_bin_count;
++			float cluster_z_bin_scale;
++
++			uint32_t cluster_z_bin_offset;
++			uint32_t pad0;
++			uint32_t pad1;
++			uint32_t pad2;
+ 
+ 			float cam_rotation[12];
+ 			float to_prev_view[16];
+@@ -350,7 +356,6 @@ class Fog : public RendererFog {
+ 		Vector2i rb_size;
+ 		double time;
+ 		bool is_using_radiance_octmap_array;
+-		uint32_t max_cluster_elements;
+ 		bool volumetric_fog_filter_active;
+ 		RID shadow_sampler;
+ 		RID voxel_gi_buffer;
+diff --git a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
+index b6be55456639a..be781382e7a80 100644
+--- a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
++++ b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.cpp
+@@ -723,14 +723,17 @@ uint32_t RenderForwardClustered::_setup_environment(const RenderDataRD *p_render
+ 
+ 	// now do implementation UBO
+ 
+-	scene_state.ubo.cluster_shift = Math::get_shift_from_power_of_2(p_render_data->cluster_size);
+-	scene_state.ubo.max_cluster_element_count_div_32 = p_render_data->cluster_max_elements / 32;
++	scene_state.ubo.tile_shift = Math::get_shift_from_power_of_2(p_render_data->tile_size);
++	scene_state.ubo.bitmasks_per_tile_count = p_render_data->cluster_max_elements / 32;
+ 	{
+-		uint32_t cluster_screen_width = Math::division_round_up((uint32_t)p_screen_size.width, p_render_data->cluster_size);
+-		uint32_t cluster_screen_height = Math::division_round_up((uint32_t)p_screen_size.height, p_render_data->cluster_size);
+-		scene_state.ubo.cluster_type_size = cluster_screen_width * cluster_screen_height * (scene_state.ubo.max_cluster_element_count_div_32 + 32);
+-		scene_state.ubo.cluster_width = cluster_screen_width;
++		uint32_t tiles_per_row = Math::division_round_up((uint32_t)p_screen_size.width, p_render_data->tile_size);
++		uint32_t tiles_per_column = Math::division_round_up((uint32_t)p_screen_size.height, p_render_data->tile_size);
++		scene_state.ubo.bitmasks_per_type_count = tiles_per_row * tiles_per_column * scene_state.ubo.bitmasks_per_tile_count;
++		scene_state.ubo.tiles_per_row = tiles_per_row;
+ 	}
++	scene_state.ubo.cluster_z_bin_offset = scene_state.ubo.bitmasks_per_type_count * ClusterBuilderRD::ELEMENT_TYPE_MAX;
++	scene_state.ubo.cluster_z_bin_count = ClusterBuilderRD::get_z_bin_count(p_render_data->scene_data->z_near, p_render_data->scene_data->z_far);
++	scene_state.ubo.cluster_z_bin_scale = ClusterBuilderRD::get_z_bin_scale(p_render_data->scene_data->z_near, p_render_data->scene_data->z_far);
+ 
+ 	scene_state.ubo.gi_upscale_for_msaa = false;
+ 	scene_state.ubo.volumetric_fog_enabled = false;
+@@ -1391,7 +1394,6 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
+ 		settings.rb_size = size;
+ 		settings.time = time;
+ 		settings.is_using_radiance_octmap_array = is_using_radiance_octmap_array();
+-		settings.max_cluster_elements = RendererRD::LightStorage::get_singleton()->get_max_cluster_elements();
+ 		settings.volumetric_fog_filter_active = get_volumetric_fog_filter_active();
+ 
+ 		settings.shadow_sampler = shadow_sampler;
+@@ -1849,7 +1851,7 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
+ 	ERR_FAIL_NULL(current_cluster_builder);
+ 
+ 	p_render_data->cluster_buffer = current_cluster_builder->get_cluster_buffer();
+-	p_render_data->cluster_size = current_cluster_builder->get_cluster_size();
++	p_render_data->tile_size = current_cluster_builder->get_tile_size();
+ 	p_render_data->cluster_max_elements = current_cluster_builder->get_max_cluster_elements();
+ 
+ 	_update_vrs(rb);
+@@ -2927,7 +2929,7 @@ void RenderForwardClustered::_render_shadow_append(RID p_framebuffer, const Page
+ 
+ 	RenderDataRD render_data;
+ 	render_data.scene_data = &scene_data;
+-	render_data.cluster_size = 1;
++	render_data.tile_size = 1;
+ 	render_data.cluster_max_elements = 32;
+ 	render_data.instances = &p_instances;
+ 	render_data.render_info = p_render_info;
+@@ -3031,7 +3033,7 @@ void RenderForwardClustered::_render_particle_collider_heightfield(RID p_fb, con
+ 
+ 	RenderDataRD render_data;
+ 	render_data.scene_data = &scene_data;
+-	render_data.cluster_size = 1;
++	render_data.tile_size = 1;
+ 	render_data.cluster_max_elements = 32;
+ 	render_data.instances = &p_instances;
+ 
+@@ -3077,7 +3079,7 @@ void RenderForwardClustered::_render_material(const Transform3D &p_cam_transform
+ 
+ 	RenderDataRD render_data;
+ 	render_data.scene_data = &scene_data;
+-	render_data.cluster_size = 1;
++	render_data.tile_size = 1;
+ 	render_data.cluster_max_elements = 32;
+ 	render_data.instances = &p_instances;
+ 
+@@ -3133,7 +3135,7 @@ void RenderForwardClustered::_render_uv2(const PagedArray<RenderGeometryInstance
+ 
+ 	RenderDataRD render_data;
+ 	render_data.scene_data = &scene_data;
+-	render_data.cluster_size = 1;
++	render_data.tile_size = 1;
+ 	render_data.cluster_max_elements = 32;
+ 	render_data.instances = &p_instances;
+ 
+@@ -3209,7 +3211,7 @@ void RenderForwardClustered::_render_sdfgi(Ref<RenderSceneBuffersRD> p_render_bu
+ 
+ 	RenderDataRD render_data;
+ 	render_data.scene_data = &scene_data;
+-	render_data.cluster_size = 1;
++	render_data.tile_size = 1;
+ 	render_data.cluster_max_elements = 32;
+ 	render_data.instances = &p_instances;
+ 
+diff --git a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h
+index aff29be18d2fa..d53a9a3fed9e0 100644
+--- a/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h
++++ b/servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h
+@@ -306,10 +306,15 @@ class RenderForwardClustered : public RendererSceneRenderRD {
+ 	struct SceneState {
+ 		// This struct is loaded into Set 1 - Binding 1, populated at start of rendering a frame, must match with shader code
+ 		struct UBO {
+-			uint32_t cluster_shift;
+-			uint32_t cluster_width;
+-			uint32_t cluster_type_size;
+-			uint32_t max_cluster_element_count_div_32;
++			uint32_t tile_shift;
++			uint32_t tiles_per_row;
++			uint32_t bitmasks_per_type_count;
++			uint32_t bitmasks_per_tile_count;
++
++			uint32_t cluster_z_bin_offset;
++			uint32_t cluster_z_bin_count;
++			float cluster_z_bin_scale;
++			uint32_t pad0;
+ 
+ 			uint32_t ss_effects_flags;
+ 			float ssao_light_affect;
+diff --git a/servers/rendering/renderer_rd/shaders/cluster_debug.glsl b/servers/rendering/renderer_rd/shaders/cluster_debug.glsl
+index 0034de8c91046..00d5a8fd64b6c 100644
+--- a/servers/rendering/renderer_rd/shaders/cluster_debug.glsl
++++ b/servers/rendering/renderer_rd/shaders/cluster_debug.glsl
+@@ -42,15 +42,20 @@ const vec3 usage_gradient[33] = vec3[]( // 1 (none) + 32
+ 		vec3(1.00, 0.63, 0.70));
+ layout(push_constant, std430) uniform Params {
+ 	uvec2 screen_size;
+-	uvec2 cluster_screen_size;
++	uvec2 screen_size_in_tiles;
+ 
+-	uint cluster_shift;
++	uint tile_shift;
+ 	uint cluster_type;
+ 	float z_near;
+ 	float z_far;
+ 
+ 	bool orthogonal;
+-	uint max_cluster_element_count_div_32;
++	uint bitmasks_per_tile_count;
++	uint z_bin_offset;
++	uint z_bin_count;
++
++	float z_bin_scale;
++	uint pad0;
+ 	uint pad1;
+ 	uint pad2;
+ }
+@@ -71,37 +76,36 @@ void main() {
+ 		return;
+ 	}
+ 
+-	uvec2 cluster_pos = screen_pos >> params.cluster_shift;
++	uvec2 tile_pos = screen_pos >> params.tile_shift;
+ 
+-	uint offset = cluster_pos.y * params.cluster_screen_size.x + cluster_pos.x;
+-	offset += params.cluster_screen_size.x * params.cluster_screen_size.y * params.cluster_type;
+-	offset *= (params.max_cluster_element_count_div_32 + 32);
++	uint tile_offset = tile_pos.y * params.screen_size_in_tiles.x + tile_pos.x;
++	tile_offset += params.screen_size_in_tiles.x * params.screen_size_in_tiles.y * params.cluster_type;
++	tile_offset *= params.bitmasks_per_tile_count;
+ 
+ 	//depth buffers generally can't be accessed via image API
+ 	float depth = texelFetch(sampler2D(depth_buffer, depth_buffer_sampler), ivec2(screen_pos), 0).r * 2.0 - 1.0;
+ 
+ 	if (params.orthogonal) {
+-		depth = ((depth + (params.z_far + params.z_near) / (params.z_far - params.z_near)) * (params.z_far - params.z_near)) / 2.0;
++		depth = -(depth * (params.z_far - params.z_near) - (params.z_far + params.z_near)) / 2.0;
+ 	} else {
+-		depth = 2.0 * params.z_near * params.z_far / (params.z_far + params.z_near - depth * (params.z_far - params.z_near));
++		depth = 2.0 * params.z_near * params.z_far / (params.z_far + params.z_near + depth * (params.z_far - params.z_near));
+ 	}
+-	depth /= params.z_far;
+ 
+-	uint slice = uint(clamp(floor(depth * 32.0), 0.0, 31.0));
+-	uint slice_minmax = cluster_data.data[offset + params.max_cluster_element_count_div_32 + slice];
+-	uint item_min = slice_minmax & 0xFFFF;
+-	uint item_max = slice_minmax >> 16;
++	uint z_bin = uint(clamp((depth - params.z_near) * params.z_bin_scale, 0.0, float(params.z_bin_count - 1)));
++	uint z_bin_minmax = cluster_data.data[params.z_bin_offset + params.cluster_type * params.z_bin_count + z_bin];
++	uint item_min = z_bin_minmax & 0xFFFF;
++	uint item_max = z_bin_minmax >> 16;
+ 
+ 	uint item_count = 0;
+-	for (uint i = 0; i < params.max_cluster_element_count_div_32; i++) {
+-		uint slice_bits = cluster_data.data[offset + i];
+-		while (slice_bits != 0) {
+-			uint bit = findLSB(slice_bits);
++	for (uint i = 0; i < params.bitmasks_per_tile_count; i++) {
++		uint tile_bits = cluster_data.data[tile_offset + i];
++		while (tile_bits != 0) {
++			uint bit = findLSB(tile_bits);
+ 			uint item = i * 32 + bit;
+ 			if ((item >= item_min && item < item_max)) {
+ 				item_count++;
+ 			}
+-			slice_bits &= ~(1 << bit);
++			tile_bits &= ~(1 << bit);
+ 		}
+ 	}
+ 
+@@ -109,7 +113,7 @@ void main() {
+ 
+ 	vec3 color = usage_gradient[item_count];
+ 
+-	color = mix(color * 1.2, color * 0.3, float(slice) / 31.0);
++	color = mix(color * 1.2, color * 0.3, float(z_bin) / float(params.z_bin_count));
+ 
+ 	imageStore(screen_buffer, ivec2(screen_pos), vec4(color, 1.0));
+ }
+diff --git a/servers/rendering/renderer_rd/shaders/cluster_render.glsl b/servers/rendering/renderer_rd/shaders/cluster_render.glsl
+index 80d7a0b6a22d8..9bcb274b81000 100644
+--- a/servers/rendering/renderer_rd/shaders/cluster_render.glsl
++++ b/servers/rendering/renderer_rd/shaders/cluster_render.glsl
+@@ -6,7 +6,7 @@
+ 
+ layout(location = 0) in vec3 vertex_attrib;
+ 
+-layout(location = 0) out float depth_interp;
++layout(location = 0) out flat uint element_type;
+ layout(location = 1) out flat uint element_index;
+ 
+ layout(push_constant, std430) uniform Params {
+@@ -20,26 +20,21 @@ params;
+ layout(set = 0, binding = 1, std140) uniform State {
+ 	mat4 projection;
+ 
+-	float inv_z_far;
+-	uint screen_to_clusters_shift; // shift to obtain coordinates in block indices
+-	uint cluster_screen_width; //
+-	uint cluster_data_size; // how much data for a single cluster takes
+-
+-	uint cluster_depth_offset;
+-	uint pad0;
+-	uint pad1;
+-	uint pad2;
++	uint screen_to_tiles_shift; // shift to obtain coordinates in block indices
++	uint tiles_per_row;
++	uint bitmasks_per_tile_count; // how many mask words a single tile takes
++	uint bitmasks_per_type_count; // how many mask words all tiles of one element type take
+ }
+ state;
+ 
+ struct RenderElement {
+ 	uint type; //0-4
+-	bool touches_near;
+-	bool touches_far;
+ 	uint original_index;
++	uint pad0;
++	uint pad1;
+ 	mat3x4 transform_inv;
+ 	vec3 scale;
+-	uint pad;
++	uint pad2;
+ };
+ 
+ layout(set = 0, binding = 2, std430) buffer restrict readonly RenderElements {
+@@ -48,13 +43,15 @@ layout(set = 0, binding = 2, std430) buffer restrict readonly RenderElements {
+ render_elements;
+ 
+ void main() {
+-	element_index = params.base_index + gl_InstanceIndex;
++	uint render_element = params.base_index + gl_InstanceIndex;
++
++	element_type = render_elements.data[render_element].type;
++	element_index = render_elements.data[render_element].original_index;
+ 
+ 	vec3 vertex = vertex_attrib;
+-	vertex *= render_elements.data[element_index].scale;
++	vertex *= render_elements.data[render_element].scale;
+ 
+-	vertex = vec4(vertex, 1.0) * render_elements.data[element_index].transform_inv;
+-	depth_interp = -vertex.z;
++	vertex = vec4(vertex, 1.0) * render_elements.data[render_element].transform_inv;
+ 
+ 	gl_Position = state.projection * vec4(vertex, 1.0);
+ }
+@@ -66,77 +63,63 @@ void main() {
+ #VERSION_DEFINES
+ 
+ #extension GL_KHR_shader_subgroup_ballot : enable
+-#extension GL_KHR_shader_subgroup_arithmetic : enable
+ #extension GL_KHR_shader_subgroup_vote : enable
+ 
+ // On Apple platforms, gl_HelperInvocation (simd_is_helper_thread()) is unreliable with MSAA, causing rendering artifacts.
+ // Setting this to false will disable the helper invocation check.
+ layout(constant_id = 0) const bool sc_use_helper_check = true;
+ 
+-layout(location = 0) in float depth_interp;
++layout(location = 0) in flat uint element_type;
+ layout(location = 1) in flat uint element_index;
+ 
+ layout(set = 0, binding = 1, std140) uniform State {
+ 	mat4 projection;
+-	float inv_z_far;
+-	uint screen_to_clusters_shift; // shift to obtain coordinates in block indices
+-	uint cluster_screen_width; //
+-	uint cluster_data_size; // how much data for a single cluster takes
+-	uint cluster_depth_offset;
+-	uint pad0;
+-	uint pad1;
+-	uint pad2;
++
++	uint screen_to_tiles_shift; // shift to obtain coordinates in block indices
++	uint tiles_per_row;
++	uint bitmasks_per_tile_count; // how many mask words a single tile takes
++	uint bitmasks_per_type_count; // how many mask words all tiles of one element type take
+ }
+ state;
+ 
+-//cluster data is layout linearly, each cell contains the follow information:
+-// - list of bits for every element to mark as used, so (max_elem_count/32)*4 uints
+-// - a uint for each element to mark the depth bits used when rendering (0-31)
++//cluster data is layout linearly by element type, each cell contains a bit for every element of that type to mark it as used
+ 
+-layout(set = 0, binding = 3, std430) buffer restrict ClusterRender {
++layout(set = 0, binding = 3, std430) buffer restrict ClusterData {
+ 	uint data[];
+ }
+-cluster_render;
++cluster_data;
+ 
+ #ifdef USE_ATTACHMENT
+ layout(location = 0) out vec4 frag_color;
+ #endif
+ 
+ void main() {
+-	//convert from screen to cluster
+-	uvec2 cluster = uvec2(gl_FragCoord.xy) >> state.screen_to_clusters_shift;
++	//convert from screen to tile
++	uvec2 tile_pos = uvec2(gl_FragCoord.xy) >> state.screen_to_tiles_shift;
+ 
+-	//get linear cluster offset from screen poss
+-	uint cluster_offset = cluster.x + state.cluster_screen_width * cluster.y;
+-	//multiply by data size to position at the beginning of the element list for this cluster
+-	cluster_offset *= state.cluster_data_size;
++	//get linear tile offset from screen poss
++	uint tile_offset = tile_pos.x + state.tiles_per_row * tile_pos.y;
++	//multiply by data size to position at the beginning of the element list for this tile
++	tile_offset *= state.bitmasks_per_tile_count;
+ 
+ 	//find the current element in the list and plot the bit to mark it as used
+-	uint usage_write_offset = cluster_offset + (element_index >> 5);
++	uint usage_write_offset = element_type * state.bitmasks_per_type_count + tile_offset + (element_index >> 5);
+ 	uint usage_write_bit = 1 << (element_index & 0x1F);
+ 
+ 	uint aux = 0;
+ 
+-	//find the current element in the depth usage list and mark the current depth as used
+-	float unit_depth = depth_interp * state.inv_z_far;
+-
+-	uint z_bit = clamp(uint(floor(unit_depth * 32.0)), 0, 31);
+-
+-	uint z_write_offset = cluster_offset + state.cluster_depth_offset + element_index;
+-	uint z_write_bit = 1 << z_bit;
+-
+ 	if (sc_use_helper_check) {
+ 		//https://advances.realtimerendering.com/s2017/2017_Sig_Improved_Culling_final.pdf
+ 		if (!gl_HelperInvocation) {
+ 			uvec4 mask;
+ 
+ 			while (true) {
+-				// find the cluster offset of the first active thread
++				// find the tile offset of the first active thread
+ 				// threads that did break; go inactive and no longer count
+-				uint first = subgroupBroadcastFirst(cluster_offset);
+-				// update the mask for thread that match this cluster
+-				mask = subgroupBallot(first == cluster_offset);
+-				if (first == cluster_offset) {
++				uint first = subgroupBroadcastFirst(tile_offset);
++				// update the mask for thread that match this tile
++				mask = subgroupBallot(first == tile_offset);
++				if (first == tile_offset) {
+ 					// This thread belongs to the group of threads that match this offset,
+ 					// so exit the loop.
+ 					break;
+@@ -145,16 +128,12 @@ void main() {
+ 
+ 			uint cluster_thread_group_index = subgroupBallotExclusiveBitCount(mask);
+ 
+-			z_write_bit = subgroupOr(z_write_bit); //merge all Zs
+-
+ 			if (cluster_thread_group_index == 0) {
+-				aux = atomicOr(cluster_render.data[usage_write_offset], usage_write_bit);
+-				aux = atomicOr(cluster_render.data[z_write_offset], z_write_bit);
++				aux = atomicOr(cluster_data.data[usage_write_offset], usage_write_bit);
+ 			}
+ 		}
+ 	} else {
+-		aux = atomicOr(cluster_render.data[usage_write_offset], usage_write_bit);
+-		aux = atomicOr(cluster_render.data[z_write_offset], z_write_bit);
++		aux = atomicOr(cluster_data.data[usage_write_offset], usage_write_bit);
+ 	}
+ 
+ #ifdef USE_ATTACHMENT
+diff --git a/servers/rendering/renderer_rd/shaders/cluster_store.glsl b/servers/rendering/renderer_rd/shaders/cluster_store.glsl
+deleted file mode 100644
+index 64a145f3c6e6b..0000000000000
+--- a/servers/rendering/renderer_rd/shaders/cluster_store.glsl
++++ /dev/null
+@@ -1,119 +0,0 @@
+-#[compute]
+-
+-#version 450
+-
+-#VERSION_DEFINES
+-
+-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+-
+-layout(push_constant, std430) uniform Params {
+-	uint cluster_render_data_size; // how much data for a single cluster takes
+-	uint max_render_element_count_div_32; //divided by 32
+-	uvec2 cluster_screen_size;
+-	uint render_element_count_div_32; //divided by 32
+-
+-	uint max_cluster_element_count_div_32; //divided by 32
+-	uint pad1;
+-	uint pad2;
+-}
+-params;
+-
+-layout(set = 0, binding = 1, std430) buffer restrict readonly ClusterRender {
+-	uint data[];
+-}
+-cluster_render;
+-
+-layout(set = 0, binding = 2, std430) buffer restrict ClusterStore {
+-	uint data[];
+-}
+-cluster_store;
+-
+-struct RenderElement {
+-	uint type; //0-4
+-	bool touches_near;
+-	bool touches_far;
+-	uint original_index;
+-	mat3x4 transform_inv;
+-	vec3 scale;
+-	uint pad;
+-};
+-
+-layout(set = 0, binding = 3, std430) buffer restrict readonly RenderElements {
+-	RenderElement data[];
+-}
+-render_elements;
+-
+-void main() {
+-	uvec2 pos = gl_GlobalInvocationID.xy;
+-	if (any(greaterThanEqual(pos, params.cluster_screen_size))) {
+-		return;
+-	}
+-
+-	//counter for each type of render_element
+-
+-	//base offset for this cluster
+-	uint base_offset = (pos.x + params.cluster_screen_size.x * pos.y);
+-	uint src_offset = base_offset * params.cluster_render_data_size;
+-
+-	uint render_element_offset = 0;
+-
+-	//check all render_elements and see which one was written to
+-	while (render_element_offset < params.render_element_count_div_32) {
+-		uint bits = cluster_render.data[src_offset + render_element_offset];
+-		while (bits != 0) {
+-			//if bits exist, check the render_element
+-			uint index_bit = findLSB(bits);
+-			uint index = render_element_offset * 32 + index_bit;
+-			uint type = render_elements.data[index].type;
+-
+-			uint z_range_offset = src_offset + params.max_render_element_count_div_32 + index;
+-			uint z_range = cluster_render.data[z_range_offset];
+-
+-			//if object was written, z was written, but check just in case
+-			if (z_range != 0) { //should always be > 0
+-
+-				uint from_z = findLSB(z_range);
+-				uint to_z = findMSB(z_range) + 1;
+-
+-				if (render_elements.data[index].touches_near) {
+-					from_z = 0;
+-				}
+-
+-				if (render_elements.data[index].touches_far) {
+-					to_z = 32;
+-				}
+-
+-				// find cluster offset in the buffer used for indexing in the renderer
+-				uint dst_offset = (base_offset + type * (params.cluster_screen_size.x * params.cluster_screen_size.y)) * (params.max_cluster_element_count_div_32 + 32);
+-
+-				uint orig_index = render_elements.data[index].original_index;
+-				//store this index in the Z slices by setting the relevant bit
+-				for (uint i = from_z; i < to_z; i++) {
+-					uint slice_ofs = dst_offset + params.max_cluster_element_count_div_32 + i;
+-
+-					uint minmax = cluster_store.data[slice_ofs];
+-
+-					if (minmax == 0) {
+-						minmax = 0xFFFF; //min 0, max 0xFFFF
+-					}
+-
+-					uint elem_min = min(orig_index, minmax & 0xFFFF);
+-					uint elem_max = max(orig_index + 1, minmax >> 16); //always store plus one, so zero means range is empty when not written to
+-
+-					minmax = elem_min | (elem_max << 16);
+-					cluster_store.data[slice_ofs] = minmax;
+-				}
+-
+-				uint store_word = orig_index >> 5;
+-				uint store_bit = orig_index & 0x1F;
+-
+-				//store the actual render_element index at the end, so the rendering code can reference it
+-				cluster_store.data[dst_offset + store_word] |= 1 << store_bit;
+-			}
+-
+-			bits &= ~(1 << index_bit); //clear the bit to continue iterating
+-		}
+-
+-		render_element_offset++;
+-	}
+-}
+diff --git a/servers/rendering/renderer_rd/shaders/environment/volumetric_fog_process.glsl b/servers/rendering/renderer_rd/shaders/environment/volumetric_fog_process.glsl
+index 22b9fd0c632e7..baea2fdc3ba5a 100644
+--- a/servers/rendering/renderer_rd/shaders/environment/volumetric_fog_process.glsl
++++ b/servers/rendering/renderer_rd/shaders/environment/volumetric_fog_process.glsl
+@@ -155,7 +155,7 @@ layout(set = 0, binding = 15, std140) uniform Params {
+ 
+ 	float fog_frustum_end;
+ 	float ambient_inject;
+-	float z_far;
++	float z_near;
+ 	int filter_axis;
+ 
+ 	vec3 ambient_color;
+@@ -173,19 +173,25 @@ layout(set = 0, binding = 15, std140) uniform Params {
+ 	float detail_spread;
+ 	float gi_inject;
+ 	uint max_voxel_gi_instances;
+-	uint cluster_type_size;
++	uint bitmasks_per_type_count;
+ 
+ 	vec2 screen_size;
+-	uint cluster_shift;
+-	uint cluster_width;
++	uint tile_shift;
++	uint tiles_per_row;
+ 
+-	uint max_cluster_element_count_div_32;
++	uint bitmasks_per_tile_count;
+ 	bool use_temporal_reprojection;
+ 	uint temporal_frame;
+ 	float temporal_blend;
+ 
+ 	vec2 sky_border_size;
+-	vec2 pad;
++	uint cluster_z_bin_count;
++	float cluster_z_bin_scale;
++
++	uint cluster_z_bin_offset;
++	uint pad0;
++	uint pad1;
++	uint pad2;
+ 
+ 	mat3x4 cam_rotation;
+ 	mat4 to_prev_view;
+@@ -253,9 +259,9 @@ void cluster_get_item_range(uint p_offset, out uint item_min, out uint item_max,
+ }
+ 
+ uint cluster_get_range_clip_mask(uint i, uint z_min, uint z_max) {
+-	int local_min = clamp(int(z_min) - int(i) * 32, 0, 31);
+-	int mask_width = min(int(z_max) - int(z_min), 32 - local_min);
+-	return bitfieldInsert(uint(0), uint(0xFFFFFFFF), local_min, mask_width);
++	int local_min = clamp(int(z_min) - int(i) * 32, 0, 32);
++	int local_max = clamp(int(z_max) - int(i) * 32, 0, 32);
++	return bitfieldInsert(uint(0), uint(0xFFFFFFFF), local_min, local_max - local_min);
+ }
+ 
+ float henyey_greenstein(float cos_theta, float g) {
+@@ -311,8 +317,8 @@ void main() {
+ 	vec3 fog_unit_pos = posf * fog_cell_size + fog_cell_size * 0.5; //center of voxels
+ 
+ 	uvec2 screen_pos = uvec2(fog_unit_pos.xy * params.screen_size);
+-	uvec2 cluster_pos = screen_pos >> params.cluster_shift;
+-	uint cluster_offset = (params.cluster_width * cluster_pos.y + cluster_pos.x) * (params.max_cluster_element_count_div_32 + 32);
++	uvec2 tile_pos = screen_pos >> params.tile_shift;
++	uint tile_offset = (params.tiles_per_row * tile_pos.y + tile_pos.x) * params.bitmasks_per_tile_count;
+ 	//positions in screen are too spread apart, no hopes for optimizing with subgroups
+ 
+ 	fog_unit_pos.z = pow(fog_unit_pos.z, params.detail_spread);
+@@ -349,8 +355,8 @@ void main() {
+ 			fog_unit_pos = posf * fog_cell_size + fog_cell_size * halton_map[params.temporal_frame]; //center of voxels, offset by halton table
+ 
+ 			screen_pos = uvec2(fog_unit_pos.xy * params.screen_size);
+-			cluster_pos = screen_pos >> params.cluster_shift;
+-			cluster_offset = (params.cluster_width * cluster_pos.y + cluster_pos.x) * (params.max_cluster_element_count_div_32 + 32);
++			tile_pos = screen_pos >> params.tile_shift;
++			tile_offset = (params.tiles_per_row * tile_pos.y + tile_pos.x) * params.bitmasks_per_tile_count;
+ 			//positions in screen are too spread apart, no hopes for optimizing with subgroups
+ 
+ 			fog_unit_pos.z = pow(fog_unit_pos.z, params.detail_spread);
+@@ -361,7 +367,7 @@ void main() {
+ 		}
+ 	}
+ 
+-	uint cluster_z = uint(clamp((abs(view_pos.z) / params.z_far) * 32.0, 0.0, 31.0));
++	uint z_bin = params.cluster_z_bin_offset + uint(clamp((abs(view_pos.z) - params.z_near) * params.cluster_z_bin_scale, 0.0, float(params.cluster_z_bin_count - 1)));
+ 
+ 	vec3 total_light = vec3(0.0);
+ 
+@@ -463,17 +469,17 @@ void main() {
+ 
+ 		{ //omni lights
+ 
+-			uint cluster_omni_offset = cluster_offset;
++			uint tile_omni_offset = tile_offset;
+ 
+ 			uint item_min;
+ 			uint item_max;
+ 			uint item_from;
+ 			uint item_to;
+ 
+-			cluster_get_item_range(cluster_omni_offset + params.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++			cluster_get_item_range(z_bin, item_min, item_max, item_from, item_to);
+ 
+ 			for (uint i = item_from; i < item_to; i++) {
+-				uint mask = cluster_buffer.data[cluster_omni_offset + i];
++				uint mask = cluster_buffer.data[tile_omni_offset + i];
+ 				mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 				uint merged_mask = mask;
+ 
+@@ -530,17 +536,17 @@ void main() {
+ 
+ 		{ //spot lights
+ 
+-			uint cluster_spot_offset = cluster_offset + params.cluster_type_size;
++			uint tile_spot_offset = tile_offset + params.bitmasks_per_type_count;
+ 
+ 			uint item_min;
+ 			uint item_max;
+ 			uint item_from;
+ 			uint item_to;
+ 
+-			cluster_get_item_range(cluster_spot_offset + params.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++			cluster_get_item_range(z_bin + params.cluster_z_bin_count, item_min, item_max, item_from, item_to);
+ 
+ 			for (uint i = item_from; i < item_to; i++) {
+-				uint mask = cluster_buffer.data[cluster_spot_offset + i];
++				uint mask = cluster_buffer.data[tile_spot_offset + i];
+ 				mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 				uint merged_mask = mask;
+ 
+@@ -595,17 +601,17 @@ void main() {
+ 
+ 		{ //area lights
+ 
+-			uint cluster_area_offset = cluster_offset + params.cluster_type_size * 2;
++			uint tile_area_offset = tile_offset + params.bitmasks_per_type_count * 2;
+ 
+ 			uint item_min;
+ 			uint item_max;
+ 			uint item_from;
+ 			uint item_to;
+ 
+-			cluster_get_item_range(cluster_area_offset + params.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++			cluster_get_item_range(z_bin + params.cluster_z_bin_count * 2, item_min, item_max, item_from, item_to);
+ 
+ 			for (uint i = item_from; i < item_to; i++) {
+-				uint mask = cluster_buffer.data[cluster_area_offset + i];
++				uint mask = cluster_buffer.data[tile_area_offset + i];
+ 				mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 				uint merged_mask = mask;
+ 
+diff --git a/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl b/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl
+index de1cb92e51ee4..e38eae0059702 100644
+--- a/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl
++++ b/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl
+@@ -171,9 +171,9 @@ void cluster_get_item_range(uint p_offset, out uint item_min, out uint item_max,
+ }
+ 
+ uint cluster_get_range_clip_mask(uint i, uint z_min, uint z_max) {
+-	int local_min = clamp(int(z_min) - int(i) * 32, 0, 31);
+-	int mask_width = min(int(z_max) - int(z_min), 32 - local_min);
+-	return bitfieldInsert(uint(0), uint(0xFFFFFFFF), local_min, mask_width);
++	int local_min = clamp(int(z_min) - int(i) * 32, 0, 32);
++	int local_max = clamp(int(z_max) - int(i) * 32, 0, 32);
++	return bitfieldInsert(uint(0), uint(0xFFFFFFFF), local_min, local_max - local_min);
+ }
+ #endif // !defined(MODE_RENDER_DEPTH) && !defined(MODE_UNSHADED) && defined(USE_VERTEX_LIGHTING)
+ 
+@@ -547,23 +547,23 @@ void vertex_shader(vec3 vertex_input,
+ 
+ 	uvec2 screen_size = uvec2(1.0 / scene_data.screen_pixel_size);
+ 	uvec2 screen_pixel = clamp(uvec2(clip_pos * vec2(screen_size)), uvec2(0), screen_size - uvec2(1));
+-	uvec2 cluster_pos = screen_pixel >> implementation_data.cluster_shift;
+-	uint cluster_offset = (implementation_data.cluster_width * cluster_pos.y + cluster_pos.x) * (implementation_data.max_cluster_element_count_div_32 + 32);
+-	uint cluster_z = uint(clamp((-vertex_interp.z / scene_data.z_far) * 32.0, 0.0, 31.0));
++	uvec2 tile_pos = screen_pixel >> implementation_data.tile_shift;
++	uint tile_offset = (implementation_data.tiles_per_row * tile_pos.y + tile_pos.x) * implementation_data.bitmasks_per_tile_count;
++	uint z_bin = implementation_data.cluster_z_bin_offset + uint(clamp((-vertex_interp.z - scene_data.z_near) * implementation_data.cluster_z_bin_scale, 0.0, float(implementation_data.cluster_z_bin_count - 1)));
+ 
+ 	{ //omni lights
+ 
+-		uint cluster_omni_offset = cluster_offset;
++		uint tile_omni_offset = tile_offset;
+ 
+ 		uint item_min;
+ 		uint item_max;
+ 		uint item_from;
+ 		uint item_to;
+ 
+-		cluster_get_item_range(cluster_omni_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++		cluster_get_item_range(z_bin, item_min, item_max, item_from, item_to);
+ 
+ 		for (uint i = item_from; i < item_to; i++) {
+-			uint mask = cluster_buffer.data[cluster_omni_offset + i];
++			uint mask = cluster_buffer.data[tile_omni_offset + i];
+ 			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 			uint merged_mask = mask;
+ 
+@@ -587,17 +587,17 @@ void vertex_shader(vec3 vertex_input,
+ 	}
+ 
+ 	{ //spot lights
+-		uint cluster_spot_offset = cluster_offset + implementation_data.cluster_type_size;
++		uint tile_spot_offset = tile_offset + implementation_data.bitmasks_per_type_count;
+ 
+ 		uint item_min;
+ 		uint item_max;
+ 		uint item_from;
+ 		uint item_to;
+ 
+-		cluster_get_item_range(cluster_spot_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++		cluster_get_item_range(z_bin + implementation_data.cluster_z_bin_count, item_min, item_max, item_from, item_to);
+ 
+ 		for (uint i = item_from; i < item_to; i++) {
+-			uint mask = cluster_buffer.data[cluster_spot_offset + i];
++			uint mask = cluster_buffer.data[tile_spot_offset + i];
+ 			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 			uint merged_mask = mask;
+ 
+@@ -1138,9 +1138,9 @@ void cluster_get_item_range(uint p_offset, out uint item_min, out uint item_max,
+ }
+ 
+ uint cluster_get_range_clip_mask(uint i, uint z_min, uint z_max) {
+-	int local_min = clamp(int(z_min) - int(i) * 32, 0, 31);
+-	int mask_width = min(int(z_max) - int(z_min), 32 - local_min);
+-	return bitfieldInsert(uint(0), uint(0xFFFFFFFF), local_min, mask_width);
++	int local_min = clamp(int(z_min) - int(i) * 32, 0, 32);
++	int local_max = clamp(int(z_max) - int(i) * 32, 0, 32);
++	return bitfieldInsert(uint(0), uint(0xFFFFFFFF), local_min, local_max - local_min);
+ }
+ 
+ #endif //!MODE_RENDER DEPTH
+@@ -1541,13 +1541,13 @@ void fragment_shader(in SceneData scene_data) {
+ #ifndef MODE_RENDER_DEPTH
+ 
+ #ifdef USE_MULTIVIEW
+-	uvec2 cluster_pos = uvec2(combined_uv.xy / scene_data.screen_pixel_size) >> implementation_data.cluster_shift;
++	uvec2 tile_pos = uvec2(combined_uv.xy / scene_data.screen_pixel_size) >> implementation_data.tile_shift;
+ #else
+-	uvec2 cluster_pos = uvec2(gl_FragCoord.xy) >> implementation_data.cluster_shift;
++	uvec2 tile_pos = uvec2(gl_FragCoord.xy) >> implementation_data.tile_shift;
+ #endif
+-	uint cluster_offset = (implementation_data.cluster_width * cluster_pos.y + cluster_pos.x) * (implementation_data.max_cluster_element_count_div_32 + 32);
++	uint tile_offset = (implementation_data.tiles_per_row * tile_pos.y + tile_pos.x) * implementation_data.bitmasks_per_tile_count;
+ 
+-	uint cluster_z = uint(clamp((-vertex.z / scene_data.z_far) * 32.0, 0.0, 31.0));
++	uint z_bin = implementation_data.cluster_z_bin_offset + uint(clamp((-vertex.z - scene_data.z_near) * implementation_data.cluster_z_bin_scale, 0.0, float(implementation_data.cluster_z_bin_count - 1)));
+ 
+ 	//used for interpolating anything cluster related
+ 	vec3 vertex_ddx = dFdx(vertex);
+@@ -1555,20 +1555,20 @@ void fragment_shader(in SceneData scene_data) {
+ 
+ 	{ // process decals
+ 
+-		uint cluster_decal_offset = cluster_offset + implementation_data.cluster_type_size * 3;
++		uint tile_decal_offset = tile_offset + implementation_data.bitmasks_per_type_count * 3;
+ 
+ 		uint item_min;
+ 		uint item_max;
+ 		uint item_from;
+ 		uint item_to;
+ 
+-		cluster_get_item_range(cluster_decal_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++		cluster_get_item_range(z_bin + implementation_data.cluster_z_bin_count * 3, item_min, item_max, item_from, item_to);
+ 
+ 		item_from = subgroupBroadcastFirst(subgroupMin(item_from));
+ 		item_to = subgroupBroadcastFirst(subgroupMax(item_to));
+ 
+ 		for (uint i = item_from; i < item_to; i++) {
+-			uint mask = cluster_buffer.data[cluster_decal_offset + i];
++			uint mask = cluster_buffer.data[tile_decal_offset + i];
+ 			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 
+ 			uint merged_mask = subgroupBroadcastFirst(subgroupOr(mask));
+@@ -2111,14 +2111,14 @@ void fragment_shader(in SceneData scene_data) {
+ 		vec4 cc_reflection_accum = vec4(0.0, 0.0, 0.0, 0.0);
+ #endif
+ 
+-		uint cluster_reflection_offset = cluster_offset + implementation_data.cluster_type_size * 4;
++		uint tile_reflection_offset = tile_offset + implementation_data.bitmasks_per_type_count * 4;
+ 
+ 		uint item_min;
+ 		uint item_max;
+ 		uint item_from;
+ 		uint item_to;
+ 
+-		cluster_get_item_range(cluster_reflection_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++		cluster_get_item_range(z_bin + implementation_data.cluster_z_bin_count * 4, item_min, item_max, item_from, item_to);
+ 
+ 		item_from = subgroupBroadcastFirst(subgroupMin(item_from));
+ 		item_to = subgroupBroadcastFirst(subgroupMax(item_to));
+@@ -2137,7 +2137,7 @@ void fragment_shader(in SceneData scene_data) {
+ 		ref_vec = mix(ref_vec, bent_normal, roughness * roughness * roughness * roughness);
+ 
+ 		for (uint i = item_from; i < item_to; i++) {
+-			uint mask = cluster_buffer.data[cluster_reflection_offset + i];
++			uint mask = cluster_buffer.data[tile_reflection_offset + i];
+ 			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 
+ 			uint merged_mask = subgroupBroadcastFirst(subgroupOr(mask));
+@@ -2790,20 +2790,20 @@ void fragment_shader(in SceneData scene_data) {
+ #ifndef USE_VERTEX_LIGHTING
+ 	{ //omni lights
+ 
+-		uint cluster_omni_offset = cluster_offset;
++		uint tile_omni_offset = tile_offset;
+ 
+ 		uint item_min;
+ 		uint item_max;
+ 		uint item_from;
+ 		uint item_to;
+ 
+-		cluster_get_item_range(cluster_omni_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++		cluster_get_item_range(z_bin, item_min, item_max, item_from, item_to);
+ 
+ 		item_from = subgroupBroadcastFirst(subgroupMin(item_from));
+ 		item_to = subgroupBroadcastFirst(subgroupMax(item_to));
+ 
+ 		for (uint i = item_from; i < item_to; i++) {
+-			uint mask = cluster_buffer.data[cluster_omni_offset + i];
++			uint mask = cluster_buffer.data[tile_omni_offset + i];
+ 			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 
+ 			uint merged_mask = subgroupBroadcastFirst(subgroupOr(mask));
+@@ -2851,20 +2851,20 @@ void fragment_shader(in SceneData scene_data) {
+ 
+ 	{ //spot lights
+ 
+-		uint cluster_spot_offset = cluster_offset + implementation_data.cluster_type_size;
++		uint tile_spot_offset = tile_offset + implementation_data.bitmasks_per_type_count;
+ 
+ 		uint item_min;
+ 		uint item_max;
+ 		uint item_from;
+ 		uint item_to;
+ 
+-		cluster_get_item_range(cluster_spot_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++		cluster_get_item_range(z_bin + implementation_data.cluster_z_bin_count, item_min, item_max, item_from, item_to);
+ 
+ 		item_from = subgroupBroadcastFirst(subgroupMin(item_from));
+ 		item_to = subgroupBroadcastFirst(subgroupMax(item_to));
+ 
+ 		for (uint i = item_from; i < item_to; i++) {
+-			uint mask = cluster_buffer.data[cluster_spot_offset + i];
++			uint mask = cluster_buffer.data[tile_spot_offset + i];
+ 			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 
+ 			uint merged_mask = subgroupBroadcastFirst(subgroupOr(mask));
+@@ -2912,20 +2912,20 @@ void fragment_shader(in SceneData scene_data) {
+ 
+ 	if (sc_cluster_has_area_light()) { // area lights
+ 
+-		uint cluster_area_offset = cluster_offset + implementation_data.cluster_type_size * 2;
++		uint tile_area_offset = tile_offset + implementation_data.bitmasks_per_type_count * 2;
+ 
+ 		uint item_min;
+ 		uint item_max;
+ 		uint item_from;
+ 		uint item_to;
+ 
+-		cluster_get_item_range(cluster_area_offset + implementation_data.max_cluster_element_count_div_32 + cluster_z, item_min, item_max, item_from, item_to);
++		cluster_get_item_range(z_bin + implementation_data.cluster_z_bin_count * 2, item_min, item_max, item_from, item_to);
+ 
+ 		item_from = subgroupBroadcastFirst(subgroupMin(item_from));
+ 		item_to = subgroupBroadcastFirst(subgroupMax(item_to));
+ 
+ 		for (uint i = item_from; i < item_to; i++) {
+-			uint mask = cluster_buffer.data[cluster_area_offset + i];
++			uint mask = cluster_buffer.data[tile_area_offset + i];
+ 			mask &= cluster_get_range_clip_mask(i, item_min, item_max);
+ 
+ 			uint merged_mask = subgroupBroadcastFirst(subgroupOr(mask));
+diff --git a/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered_inc.glsl b/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered_inc.glsl
+index 3342d7c3e2ec7..39e70e67dfbb4 100644
+--- a/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered_inc.glsl
++++ b/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered_inc.glsl
+@@ -327,10 +327,15 @@ layout(set = 1, binding = 0, std140) uniform SceneDataBlock {
+ scene_data_block;
+ 
+ struct ImplementationData {
+-	uint cluster_shift;
+-	uint cluster_width;
+-	uint cluster_type_size;
+-	uint max_cluster_element_count_div_32;
++	uint tile_shift;
++	uint tiles_per_row;
++	uint bitmasks_per_type_count;
++	uint bitmasks_per_tile_count;
++
++	uint cluster_z_bin_offset;
++	uint cluster_z_bin_count;
++	float cluster_z_bin_scale;
++	uint pad0;
+ 
+ 	uint ss_effects_flags;
+ 	float ssao_light_affect;
+diff --git a/servers/rendering/renderer_rd/storage_rd/light_storage.cpp b/servers/rendering/renderer_rd/storage_rd/light_storage.cpp
+index 9904926b30f73..93d53d6b0a4fe 100644
+--- a/servers/rendering/renderer_rd/storage_rd/light_storage.cpp
++++ b/servers/rendering/renderer_rd/storage_rd/light_storage.cpp
+@@ -905,7 +905,8 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
+ 
+ 				omni_light_sort[omni_light_count].light_instance = light_instance;
+ 				omni_light_sort[omni_light_count].light = light;
+-				omni_light_sort[omni_light_count].depth = distance;
++				omni_light_sort[omni_light_count].nearest_depth = ClusterBuilderRD::get_light_depth_range(ClusterBuilderRD::LIGHT_TYPE_OMNI, inverse_transform * light_transform, light->param[RSE::LIGHT_PARAM_RANGE], 0.0, Vector2()).x;
++				omni_light_sort[omni_light_count].center_distance = distance;
+ 				omni_light_count++;
+ 			} break;
+ 			case RSE::LIGHT_SPOT: {
+@@ -930,7 +931,8 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
+ 
+ 				spot_light_sort[spot_light_count].light_instance = light_instance;
+ 				spot_light_sort[spot_light_count].light = light;
+-				spot_light_sort[spot_light_count].depth = distance;
++				spot_light_sort[spot_light_count].nearest_depth = ClusterBuilderRD::get_light_depth_range(ClusterBuilderRD::LIGHT_TYPE_SPOT, inverse_transform * light_transform, light->param[RSE::LIGHT_PARAM_RANGE], light->param[RSE::LIGHT_PARAM_SPOT_ANGLE], Vector2()).x;
++				spot_light_sort[spot_light_count].center_distance = distance;
+ 				spot_light_count++;
+ 			} break;
+ 			case RSE::LIGHT_AREA: {
+@@ -955,7 +957,8 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
+ 
+ 				area_light_sort[area_light_count].light_instance = light_instance;
+ 				area_light_sort[area_light_count].light = light;
+-				area_light_sort[area_light_count].depth = distance;
++				area_light_sort[area_light_count].nearest_depth = ClusterBuilderRD::get_light_depth_range(ClusterBuilderRD::LIGHT_TYPE_AREA, inverse_transform * light_transform, light->param[RSE::LIGHT_PARAM_RANGE], 0.0, light->area_size).x;
++				area_light_sort[area_light_count].center_distance = distance;
+ 				area_light_count++;
+ 			}
+ 		}
+@@ -994,21 +997,21 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
+ 			type = RSE::LIGHT_AREA;
+ 			light_instance = area_light_sort[index].light_instance;
+ 			light = area_light_sort[index].light;
+-			distance = area_light_sort[index].depth;
++			distance = area_light_sort[index].center_distance;
+ 		} else if (i >= omni_light_count) {
+ 			index = i - (omni_light_count);
+ 			light_data_ptr = &spot_lights[index];
+ 			type = RSE::LIGHT_SPOT;
+ 			light_instance = spot_light_sort[index].light_instance;
+ 			light = spot_light_sort[index].light;
+-			distance = spot_light_sort[index].depth;
++			distance = spot_light_sort[index].center_distance;
+ 		} else {
+ 			index = i;
+ 			light_data_ptr = &omni_lights[index];
+ 			type = RSE::LIGHT_OMNI;
+ 			light_instance = omni_light_sort[index].light_instance;
+ 			light = omni_light_sort[index].light;
+-			distance = omni_light_sort[index].depth;
++			distance = omni_light_sort[index].center_distance;
+ 		}
+ 
+ 		if (using_forward_ids) {
+diff --git a/servers/rendering/renderer_rd/storage_rd/light_storage.h b/servers/rendering/renderer_rd/storage_rd/light_storage.h
+index 8df2444a6eac0..abcc9a2876ec6 100644
+--- a/servers/rendering/renderer_rd/storage_rd/light_storage.h
++++ b/servers/rendering/renderer_rd/storage_rd/light_storage.h
+@@ -170,11 +170,12 @@ class LightStorage : public RendererLightStorage {
+ 	};
+ 
+ 	struct LightInstanceDepthSort {
+-		float depth;
++		float nearest_depth; // view space depth of the near edge
++		float center_distance;
+ 		LightInstance *light_instance;
+ 		Light *light;
+ 		bool operator<(const LightInstanceDepthSort &p_sort) const {
+-			return depth < p_sort.depth;
++			return nearest_depth < p_sort.nearest_depth;
+ 		}
+ 	};
+ 
+diff --git a/servers/rendering/renderer_rd/storage_rd/render_data_rd.h b/servers/rendering/renderer_rd/storage_rd/render_data_rd.h
+index 8bd2d43eb8735..55de3a3ca30fb 100644
+--- a/servers/rendering/renderer_rd/storage_rd/render_data_rd.h
++++ b/servers/rendering/renderer_rd/storage_rd/render_data_rd.h
+@@ -67,7 +67,7 @@ class RenderDataRD : public RenderData {
+ 	int reflection_probe_pass = 0;
+ 
+ 	RID cluster_buffer;
+-	uint32_t cluster_size = 0;
++	uint32_t tile_size = 0;
+ 	uint32_t cluster_max_elements = 0;
+ 
+ 	uint32_t directional_light_count = 0;
+diff --git a/servers/rendering/renderer_rd/storage_rd/texture_storage.cpp b/servers/rendering/renderer_rd/storage_rd/texture_storage.cpp
+index d9570fb894a60..92833894d52ba 100644
+--- a/servers/rendering/renderer_rd/storage_rd/texture_storage.cpp
++++ b/servers/rendering/renderer_rd/storage_rd/texture_storage.cpp
+@@ -31,6 +31,7 @@
+ #include "texture_storage.h"
+ 
+ #include "core/config/engine.h"
++#include "servers/rendering/renderer_rd/cluster_builder_rd.h"
+ #include "servers/rendering/renderer_rd/effects/copy_effects.h"
+ #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
+ #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
+@@ -4239,6 +4240,8 @@ void TextureStorage::update_decal_buffer(const PagedArray<RID> &p_decals, const
+ 	uv_xform.basis.scale(Vector3(2.0, 1.0, 2.0));
+ 	uv_xform.origin = Vector3(-1.0, 0.0, -1.0);
+ 
++	Transform3D camera_inverse_xform = p_camera_xform.affine_inverse();
++
+ 	uint32_t decals_size = p_decals.size();
+ 
+ 	decal_count = 0;
+@@ -4271,7 +4274,8 @@ void TextureStorage::update_decal_buffer(const PagedArray<RID> &p_decals, const
+ 
+ 		decal_sort[decal_count].decal_instance = decal_instance;
+ 		decal_sort[decal_count].decal = decal;
+-		decal_sort[decal_count].depth = distance - decal_instance->sorting_offset;
++		decal_sort[decal_count].nearest_depth = ClusterBuilderRD::get_box_depth_range(camera_inverse_xform * xform, decal->size / 2).x - decal_instance->sorting_offset;
++		decal_sort[decal_count].center_distance = distance;
+ 		decal_count++;
+ 	}
+ 
+@@ -4294,7 +4298,7 @@ void TextureStorage::update_decal_buffer(const PagedArray<RID> &p_decals, const
+ 		float fade = 1.0;
+ 
+ 		if (decal->distance_fade) {
+-			const real_t distance = decal_sort[i].depth + decal_instance->sorting_offset;
++			const real_t distance = decal_sort[i].center_distance;
+ 			const float fade_begin = decal->distance_fade_begin;
+ 			const float fade_length = decal->distance_fade_length;
+ 
+@@ -4313,8 +4317,6 @@ void TextureStorage::update_decal_buffer(const PagedArray<RID> &p_decals, const
+ 
+ 		Transform3D xform = decal_instance->transform;
+ 
+-		Transform3D camera_inverse_xform = p_camera_xform.affine_inverse();
+-
+ 		Transform3D to_decal_xform = (camera_inverse_xform * xform * scale_xform * uv_xform).affine_inverse();
+ 		MaterialStorage::store_transform(to_decal_xform, dd.xform);
+ 
+diff --git a/servers/rendering/renderer_rd/storage_rd/texture_storage.h b/servers/rendering/renderer_rd/storage_rd/texture_storage.h
+index d8f24c65a24e1..bdbc597813ddf 100644
+--- a/servers/rendering/renderer_rd/storage_rd/texture_storage.h
++++ b/servers/rendering/renderer_rd/storage_rd/texture_storage.h
+@@ -386,11 +386,12 @@ class TextureStorage : public RendererTextureStorage {
+ 	};
+ 
+ 	struct DecalInstanceSort {
+-		float depth;
++		float nearest_depth; // view space depth of the near edge, affected by the sorting offset
++		float center_distance;
+ 		DecalInstance *decal_instance;
+ 		Decal *decal;
+ 		bool operator<(const DecalInstanceSort &p_sort) const {
+-			return depth < p_sort.depth;
++			return nearest_depth < p_sort.nearest_depth;
+ 		}
+ 	};
+ 
