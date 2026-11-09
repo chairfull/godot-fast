@@ -4,8 +4,9 @@ A custom Godot build for Linux, targeting **Godot 4.8-dev** (master) plus a
 curated set of cherry-picked performance PRs. It started as editor
 import/filesystem speed; since v0.3.0 it also carries runtime renderer picks —
 the test is measured FPS/perf gain vs risk and rebase cost, not editor vs
-runtime. Releases ship the editor binary **and** Linux export templates built
-from the same patch series, so runtime picks reach exported games too.
+runtime. Releases ship the editor binary only — export templates are
+deliberately not built in CI (no exporting for a while, and it would roughly
+double the private-repo Actions minutes on a free plan).
 
 Built automatically by GitHub Actions on every `v*` tag push. Grab the binary
 from [Releases](../../releases).

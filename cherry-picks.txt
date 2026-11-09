@@ -51,6 +51,9 @@ PR #125234 — Refactor cluster logic (Ansraer) — RUNTIME renderer change
                   (cluster_builder_rd, fog, render_forward_clustered,
                   light_storage, texture_storage) compile against the base.
                   GLSL changes compile only at runtime — first real run is
-                  the check. Because this ships in the game, CI now also
-                  builds Linux export templates (template_debug/release)
-                  with the same patch series from v0.3.0 on.
+                  the check. NOTE: CI builds the EDITOR ONLY. Export
+                  templates are deliberately NOT built (user call 2026-11-09:
+                  no exporting for a while, and a templates job would roughly
+                  double the private-repo Actions minutes on a free plan).
+                  The runtime gain therefore lands in exported games only
+                  when templates are built manually or the job is restored.
